@@ -60,9 +60,11 @@ pub struct LocationConstraintResponse {
     pub value: Option<String>,
 }
 
+// --- ListObjects V2 ---
+
 #[derive(Debug, Serialize)]
 #[serde(rename = "ListBucketResult")]
-pub struct ListBucketResult {
+pub struct ListObjectsV2Result {
     #[serde(rename = "@xmlns")]
     pub xmlns: String,
     #[serde(rename = "Name")]
@@ -71,20 +73,115 @@ pub struct ListBucketResult {
     pub prefix: String,
     #[serde(rename = "MaxKeys")]
     pub max_keys: i32,
+    #[serde(rename = "KeyCount")]
+    pub key_count: i32,
     #[serde(rename = "IsTruncated")]
     pub is_truncated: bool,
+    #[serde(rename = "Delimiter", skip_serializing_if = "Option::is_none")]
+    pub delimiter: Option<String>,
+    #[serde(rename = "StartAfter", skip_serializing_if = "Option::is_none")]
+    pub start_after: Option<String>,
+    #[serde(rename = "ContinuationToken", skip_serializing_if = "Option::is_none")]
+    pub continuation_token: Option<String>,
+    #[serde(
+        rename = "NextContinuationToken",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub next_continuation_token: Option<String>,
+    #[serde(rename = "Contents", default)]
+    pub contents: Vec<ObjectEntry>,
+    #[serde(rename = "CommonPrefixes", default)]
+    pub common_prefixes: Vec<CommonPrefix>,
 }
 
-impl ListBucketResult {
-    pub fn empty(bucket_name: &str) -> Self {
-        Self {
-            xmlns: S3_NAMESPACE.to_string(),
-            name: bucket_name.to_string(),
-            prefix: String::new(),
-            max_keys: 1000,
-            is_truncated: false,
-        }
-    }
+#[derive(Debug, Serialize)]
+pub struct ObjectEntry {
+    #[serde(rename = "Key")]
+    pub key: String,
+    #[serde(rename = "LastModified")]
+    pub last_modified: String,
+    #[serde(rename = "ETag")]
+    pub etag: String,
+    #[serde(rename = "Size")]
+    pub size: u64,
+    #[serde(rename = "StorageClass")]
+    pub storage_class: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CommonPrefix {
+    #[serde(rename = "Prefix")]
+    pub prefix: String,
+}
+
+// --- ListObjects V1 ---
+
+#[derive(Debug, Serialize)]
+#[serde(rename = "ListBucketResult")]
+pub struct ListObjectsV1Result {
+    #[serde(rename = "@xmlns")]
+    pub xmlns: String,
+    #[serde(rename = "Name")]
+    pub name: String,
+    #[serde(rename = "Prefix")]
+    pub prefix: String,
+    #[serde(rename = "Marker")]
+    pub marker: String,
+    #[serde(rename = "MaxKeys")]
+    pub max_keys: i32,
+    #[serde(rename = "IsTruncated")]
+    pub is_truncated: bool,
+    #[serde(rename = "Delimiter", skip_serializing_if = "Option::is_none")]
+    pub delimiter: Option<String>,
+    #[serde(rename = "NextMarker", skip_serializing_if = "Option::is_none")]
+    pub next_marker: Option<String>,
+    #[serde(rename = "Contents", default)]
+    pub contents: Vec<ObjectEntry>,
+    #[serde(rename = "CommonPrefixes", default)]
+    pub common_prefixes: Vec<CommonPrefix>,
+}
+
+// --- Batch Delete ---
+
+#[derive(Debug, Deserialize)]
+#[serde(rename = "Delete")]
+pub struct DeleteRequest {
+    #[serde(rename = "Object")]
+    pub objects: Vec<DeleteObjectEntry>,
+    #[serde(rename = "Quiet", default)]
+    pub quiet: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DeleteObjectEntry {
+    #[serde(rename = "Key")]
+    pub key: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename = "DeleteResult")]
+pub struct DeleteResult {
+    #[serde(rename = "@xmlns")]
+    pub xmlns: String,
+    #[serde(rename = "Deleted", default)]
+    pub deleted: Vec<DeletedEntry>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DeletedEntry {
+    #[serde(rename = "Key")]
+    pub key: String,
+}
+
+// --- CopyObject ---
+
+#[derive(Debug, Serialize)]
+#[serde(rename = "CopyObjectResult")]
+pub struct CopyObjectResult {
+    #[serde(rename = "ETag")]
+    pub etag: String,
+    #[serde(rename = "LastModified")]
+    pub last_modified: String,
 }
 
 #[cfg(test)]
@@ -150,11 +247,51 @@ mod tests {
     }
 
     #[test]
-    fn test_serialize_empty_list_bucket_result() {
-        let result = ListBucketResult::empty("my-bucket");
+    fn test_serialize_empty_list_objects_v2_result() {
+        let result = ListObjectsV2Result {
+            xmlns: S3_NAMESPACE.to_string(),
+            name: "my-bucket".to_string(),
+            prefix: String::new(),
+            max_keys: 1000,
+            key_count: 0,
+            is_truncated: false,
+            delimiter: None,
+            start_after: None,
+            continuation_token: None,
+            next_continuation_token: None,
+            contents: vec![],
+            common_prefixes: vec![],
+        };
         let xml = to_xml_string(&result).unwrap();
         assert!(xml.contains("ListBucketResult"));
         assert!(xml.contains("my-bucket"));
         assert!(xml.contains("<IsTruncated>false</IsTruncated>"));
+        assert!(xml.contains("<KeyCount>0</KeyCount>"));
+    }
+
+    #[test]
+    fn test_serialize_list_objects_v1_result() {
+        let result = ListObjectsV1Result {
+            xmlns: S3_NAMESPACE.to_string(),
+            name: "my-bucket".to_string(),
+            prefix: String::new(),
+            marker: String::new(),
+            max_keys: 1000,
+            is_truncated: false,
+            delimiter: None,
+            next_marker: None,
+            contents: vec![ObjectEntry {
+                key: "test.txt".to_string(),
+                last_modified: "2024-01-01T00:00:00.000Z".to_string(),
+                etag: "\"abc123\"".to_string(),
+                size: 100,
+                storage_class: "STANDARD".to_string(),
+            }],
+            common_prefixes: vec![],
+        };
+        let xml = to_xml_string(&result).unwrap();
+        assert!(xml.contains("ListBucketResult"));
+        assert!(xml.contains("test.txt"));
+        assert!(xml.contains("<Size>100</Size>"));
     }
 }

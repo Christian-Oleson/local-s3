@@ -10,6 +10,7 @@ use tokio::net::TcpListener;
 
 use crate::middleware::s3_headers_middleware;
 use crate::routes::bucket;
+use crate::routes::object;
 use crate::storage::FileSystemStorage;
 
 #[derive(Clone)]
@@ -34,12 +35,20 @@ pub fn build_router(state: AppState) -> Router {
     let bucket_methods = put(bucket::create_bucket)
         .delete(bucket::delete_bucket)
         .head(bucket::head_bucket)
-        .get(bucket::get_bucket);
+        .get(bucket::get_bucket)
+        .post(bucket::delete_objects_handler);
 
     Router::new()
         .route("/", get(bucket::list_buckets))
         .route("/{bucket_name}", bucket_methods.clone())
         .route("/{bucket_name}/", bucket_methods)
+        .route(
+            "/{bucket_name}/{*key}",
+            put(object::put_object_handler)
+                .get(object::get_object_handler)
+                .head(object::head_object_handler)
+                .delete(object::delete_object_handler),
+        )
         .fallback(fallback)
         .layer(middleware::from_fn(s3_headers_middleware))
         .with_state(state)
