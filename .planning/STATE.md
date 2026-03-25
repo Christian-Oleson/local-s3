@@ -2,22 +2,16 @@
 
 ## Current Position
 
-- **Phase:** 1 - Foundation
-- **Task:** 1 (pending)
-- **Status:** planned
-
-## Plan Created
-
-- Timestamp: 2026-03-25
-- Tasks: 3
-- Estimated complexity: Medium
+- **Phase:** 2 - Core Object Operations
+- **Task:** Not started
+- **Status:** planning
 
 ## Progress
 
 | Phase | Name | Status | Tasks |
 |-------|------|--------|-------|
-| 1 | Foundation | :arrows_counterclockwise: Planned | 0/3 |
-| 2 | Core Object Operations | :hourglass_flowing_sand: Waiting | 0/13 |
+| 1 | Foundation | :white_check_mark: Complete | 3/3 |
+| 2 | Core Object Operations | :arrows_counterclockwise: Pending | 0/13 |
 | 3 | Multipart Upload & Advanced | :hourglass_flowing_sand: Waiting | 0/11 |
 | 4 | Versioning & Config Storage | :hourglass_flowing_sand: Waiting | 0/11 |
 | 5 | Docker, CI, Polish | :hourglass_flowing_sand: Waiting | 0/10 |
@@ -33,12 +27,15 @@ None
 - 2026-03-25: Accept but don't validate AWS SigV4 signatures (local dev only)
 - 2026-03-25: Target port 4566 (same as LocalStack default) for drop-in replacement
 - 2026-03-25: Phase 1 consolidated from 10 roadmap items to 3 atomic tasks
+- 2026-03-25: AWS SDK sends trailing slash on bucket ops — both /{bucket} and /{bucket}/ routes needed
+- 2026-03-25: std TcpListener must be set non-blocking before converting to tokio
 
 ## Session Log
 
 - 2026-03-25: Project initialized from requirements discussion
 - 2026-03-25: Phase 1 plan created (3 tasks)
+- 2026-03-25: Phase 1 executed and merged to main (22 tests passing)
 
 ## Next Action
 
-Run `/apes-execute 1` to start Phase 1 implementation
+Run `/apes-plan 2` to create Phase 2 task plan
