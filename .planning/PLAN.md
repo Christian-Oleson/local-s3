@@ -1,294 +1,218 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!-- Dos Apes Super Agent Framework - Phase Plan -->
 <!-- Generated: 2026-03-25 -->
-<!-- Phase: 4 -->
+<!-- Phase: 5 -->
 
 <plan>
   <metadata>
-    <phase>4</phase>
-    <name>Versioning &amp; Configuration Storage</name>
-    <goal>Bucket versioning support and storage of bucket configurations (policies, ACLs, lifecycle) without enforcement</goal>
-    <deliverable>Apps that use versioning work correctly; bucket configs are accepted and stored</deliverable>
+    <phase>5</phase>
+    <name>Docker, CI, Polish</name>
+    <goal>Production-quality Docker image, CI pipeline, documentation, and final polish</goal>
+    <deliverable>`docker run` one-liner that replaces LocalStack S3 for any developer</deliverable>
     <created>2026-03-25</created>
   </metadata>
 
   <context>
-    <dependencies>Phase 3 complete — multipart, range, conditional, tagging, CORS, 133 tests</dependencies>
+    <dependencies>Phase 4 complete — all S3 features implemented, 189 tests passing</dependencies>
     <affected_areas>
-      - src/storage/filesystem.rs — versioning state, versioned object storage, config storage
-      - src/routes/object.rs — ?versionId on GET/HEAD/DELETE, version ID in PUT response
-      - src/routes/bucket.rs — versioning/policy/ACL/lifecycle config handlers
-      - src/server.rs — virtual-hosted-style routing (optional)
-      - src/types/xml.rs — versioning, ListObjectVersions, policy, ACL, lifecycle XML types
-      - src/types/object.rs — add version_id field to ObjectMetadata
-      - src/error.rs — new error variants
+      - Dockerfile — multi-stage build
+      - docker-compose.yml — example with volume mount
+      - .github/workflows/ — CI pipeline
+      - README.md — quickstart, examples, SDK config snippets
+      - src/main.rs — health check, --log-level arg
+      - src/server.rs — health check route
+      - CLAUDE.md — update with final architecture
     </affected_areas>
     <patterns_to_follow>
-      - Versioning config at {bucket}/.versioning.json
-      - When versioning enabled: each PUT generates UUID version_id, old versions preserved
-      - Versions stored at {bucket}/.versions/{key}/{version_id}.data + {version_id}.meta.json
-      - Delete on versioned bucket creates delete marker (version with is_delete_marker=true, no data)
-      - DELETE with ?versionId permanently removes that specific version
-      - GET/HEAD with ?versionId retrieves specific version
-      - Config files: {bucket}/.policy.json, {bucket}/.acl.json, {bucket}/.lifecycle.json
-      - Store-only configs: accept and return, no enforcement
-      - Follow existing patterns: query param dispatch, xml_response(), S3Error
+      - Already have: CLI args (--port, --data-dir), tracing with env filter, release profile (LTO, strip, panic=abort)
+      - Target: musl for static linking in Docker (x86_64-unknown-linux-musl)
+      - Docker image: multi-stage build, scratch or alpine base
+      - Port 4566 default (same as LocalStack)
+      - Health check at GET / returns ListBuckets (already works)
     </patterns_to_follow>
   </context>
 
   <tasks>
-    <task id="1" type="backend" complete="false">
-      <name>Bucket versioning and versioned object operations</name>
+    <task id="1" type="setup" complete="false">
+      <name>Dockerfile, docker-compose, health check, CLI polish</name>
       <description>
-        Implement PutBucketVersioning/GetBucketVersioning, versioned object storage with
-        version IDs, ListObjectVersions, GET/HEAD/DELETE with ?versionId, and delete markers.
-        This is the most complex task — it modifies the core object storage behavior.
+        Create production Docker image, docker-compose example, add explicit health check
+        endpoint, and add --log-level CLI argument. The Dockerfile uses multi-stage build
+        with musl for static linking to produce a minimal image.
       </description>
 
       <files>
-        <modify>src/storage/filesystem.rs — versioning config, versioned put/get/head/delete, list versions</modify>
-        <modify>src/routes/object.rs — ?versionId dispatch on GET/HEAD/DELETE, version headers on PUT</modify>
-        <modify>src/routes/bucket.rs — versioning config handlers, ListObjectVersions handler</modify>
-        <modify>src/types/xml.rs — versioning XML types, ListObjectVersions types</modify>
-        <modify>src/types/object.rs — add version_id to ObjectMetadata</modify>
-        <modify>src/error.rs — MethodNotAllowed for delete marker access</modify>
-        <modify>src/server.rs — if any route changes needed</modify>
+        <create>Dockerfile                    — multi-stage: rust builder → scratch runtime</create>
+        <create>docker-compose.yml            — example with volume mount and port mapping</create>
+        <create>.dockerignore                 — exclude target/, .git/, data/, tests/</create>
+        <modify>src/main.rs                   — add --log-level arg</modify>
+        <modify>src/server.rs                 — add explicit health check GET / endpoint (return 200 OK)</modify>
       </files>
 
       <action>
-        1. Add to src/types/object.rs:
-           - Add `version_id: Option&lt;String&gt;` field to ObjectMetadata (with serde default)
-           - Add `is_delete_marker: bool` field (with serde default false)
+        1. Create Dockerfile:
+           ```dockerfile
+           # Stage 1: Build
+           FROM rust:1.94-slim AS builder
+           WORKDIR /app
+           COPY Cargo.toml Cargo.lock ./
+           COPY src/ src/
+           RUN cargo build --release
 
-        2. Add XML types to src/types/xml.rs:
+           # Stage 2: Runtime
+           FROM debian:bookworm-slim
+           RUN apt-get update &amp;&amp; apt-get install -y ca-certificates &amp;&amp; rm -rf /var/lib/apt/lists/*
+           COPY --from=builder /app/target/release/local-s3 /usr/local/bin/local-s3
 
-           VersioningConfiguration (serialize + deserialize):
-           - Status: Option&lt;String&gt; ("Enabled" or "Suspended")
+           EXPOSE 4566
+           VOLUME /data
 
-           ListVersionsResult:
-           - xmlns, Name, Prefix, MaxKeys, IsTruncated, KeyMarker, VersionIdMarker
-           - Version entries: Vec with Key, VersionId, IsLatest, LastModified, ETag, Size
-           - DeleteMarker entries: Vec with Key, VersionId, IsLatest, LastModified
+           ENTRYPOINT ["local-s3"]
+           CMD ["--port", "4566", "--data-dir", "/data"]
+           ```
 
-        3. Storage layer — versioning config:
-           - Store at {bucket}/.versioning.json: { "status": "Enabled" | "Suspended" }
-           - put_bucket_versioning(bucket, status) → Result&lt;()&gt;
-           - get_bucket_versioning(bucket) → Result&lt;Option&lt;String&gt;&gt; (None if never set)
-           - is_versioning_enabled(bucket) → bool
-           - Update is_internal_entry to match ".versioning.json" and ".versions"
+           Note: Using debian-slim instead of scratch/musl because musl cross-compilation from
+           Windows is complex and not critical for a local dev tool. Can be optimized later.
 
-        4. Storage layer — versioned object storage:
+        2. Create docker-compose.yml:
+           ```yaml
+           services:
+             local-s3:
+               build: .
+               ports:
+                 - "4566:4566"
+               volumes:
+                 - ./data:/data
+               environment:
+                 - RUST_LOG=local_s3=info
+           ```
 
-           When versioning is ENABLED:
+        3. Create .dockerignore:
+           ```
+           target/
+           .git/
+           data/
+           tests/
+           .planning/
+           .claude/
+           *.md
+           ```
 
-           a) put_object: Generate UUID version_id. Store object normally at {bucket}/{key}
-              AND save a copy at {bucket}/.versions/{key}/{version_id}.data with metadata
-              at {bucket}/.versions/{key}/{version_id}.meta.json.
-              Set version_id on the returned ObjectMetadata.
-              The "current" object always lives at the normal path.
+        4. Update src/main.rs:
+           - Add --log-level CLI arg (trace, debug, info, warn, error) defaulting to "info"
+           - Apply via EnvFilter
 
-           b) get_object: If no ?versionId, return current object (same as before).
-              If ?versionId specified, read from .versions/{key}/{version_id}.
+        5. Update src/server.rs:
+           - The root GET / route already returns ListBuckets, which serves as a health check
+           - Add a simple GET /_health route that returns 200 OK with "healthy" body
+             (Docker HEALTHCHECK can use this)
 
-           c) head_object: Same logic — with or without ?versionId.
-
-           d) delete_object (no versionId): Create a delete marker.
-              - Generate a new version_id for the delete marker
-              - Save a delete marker entry in .versions/{key}/{version_id}.meta.json
-                with is_delete_marker=true and no data file
-              - Remove the "current" object file and metadata (so GET without versionId returns 404)
-              - Return the delete marker's version_id and x-amz-delete-marker: true header
-
-           e) delete_object (with versionId): Permanently remove that specific version.
-              - Delete {version_id}.data and {version_id}.meta.json from .versions/
-              - If deleting the version that was "current", the previous version becomes current
-                (or if it was a delete marker, just remove it)
-
-           When versioning is DISABLED or SUSPENDED:
-           - put_object: Same as current behavior (no version tracking)
-              If suspended: still generate version_id "null" for new puts
-           - delete_object: Same as current (actual delete, no marker)
-
-        5. list_object_versions(bucket, prefix, max_keys, key_marker, version_id_marker):
-           - Scan .versions/{key}/ directories for all version metadata
-           - Include current version too
-           - Sort by key, then by last_modified descending
-           - Mark latest version with IsLatest=true
-           - Separate Version entries from DeleteMarker entries
-
-        6. HTTP handlers:
-
-           In routes/bucket.rs:
-           - Add `versioning` field to BucketGetQuery
-           - Add `versioning` field to BucketPutQuery
-           - GET /{bucket}?versioning → GetBucketVersioning
-           - PUT /{bucket}?versioning → PutBucketVersioning (parse XML body)
-           - GET /{bucket}?versions → ListObjectVersions
-           - Add `versions` field to BucketGetQuery
-
-           In routes/object.rs:
-           - Add `versionId` field to ObjectQuery
-           - Modify get_object_handler: pass versionId to storage if present
-           - Modify head_object_handler: pass versionId
-           - Modify delete_object_handler: pass versionId
-           - PUT response: add x-amz-version-id header when versioning enabled
-
-        7. Unit tests: versioning config, versioned put/get, delete markers, list versions
+        6. The Cargo.lock is gitignored — for Docker builds we need it.
+           Remove Cargo.lock from .gitignore so it's committed.
+           Run `cargo generate-lockfile` to create it if missing.
       </action>
 
       <verification>
-        <command>cargo build</command>
-        <command>cargo test --lib</command>
-        <command>cargo clippy -- -D warnings</command>
-        <command>cargo fmt -- --check</command>
-      </verification>
-
-      <done>
-        - Versioning enable/suspend/get works
-        - PUT with versioning enabled returns version_id
-        - GET/HEAD with ?versionId retrieves specific version
-        - DELETE on versioned bucket creates delete marker
-        - DELETE with ?versionId permanently removes version
-        - ListObjectVersions returns all versions and delete markers
-        - Non-versioned behavior unchanged
-        - All existing 133 tests pass
-      </done>
-    </task>
-
-    <task id="2" type="backend" complete="false">
-      <name>Config storage: bucket policy, ACL, lifecycle</name>
-      <description>
-        Implement store-only configuration APIs for bucket policies, ACLs, and lifecycle rules.
-        These accept and return configurations but do not enforce them — matching
-        LocalStack's behavior for local development.
-      </description>
-
-      <files>
-        <modify>src/storage/filesystem.rs — policy, ACL, lifecycle storage methods</modify>
-        <modify>src/routes/bucket.rs — config handler dispatch</modify>
-        <modify>src/types/xml.rs — ACL XML types (policy is JSON, lifecycle is XML)</modify>
-        <modify>src/error.rs — NoSuchBucketPolicy, etc.</modify>
-      </files>
-
-      <action>
-        1. Bucket Policy (JSON, not XML):
-           Storage: {bucket}/.policy.json (raw JSON string, not parsed)
-           - put_bucket_policy(bucket, policy_json: String) → Result&lt;()&gt;
-           - get_bucket_policy(bucket) → Result&lt;String&gt; (returns raw JSON)
-           - delete_bucket_policy(bucket) → Result&lt;()&gt;
-
-           HTTP: PUT/GET/DELETE /{bucket}?policy
-           - PUT body is raw JSON (Content-Type: application/json), store as-is
-           - GET returns raw JSON
-           - DELETE removes the file
-           Add NoSuchBucketPolicy error variant (404).
-
-        2. Bucket ACL (XML):
-           Storage: {bucket}/.acl.json
-           - put_bucket_acl(bucket, acl_xml: String) → Result&lt;()&gt; (store raw XML as string)
-           - get_bucket_acl(bucket) → Result&lt;String&gt;
-
-           HTTP: PUT/GET /{bucket}?acl
-           - PUT body is XML, store as-is
-           - GET returns stored XML, or default ACL if not set
-           Default ACL: full control for owner (standard S3 default)
-
-        3. Object ACL (XML):
-           Storage: {bucket}/.acls/{key}.json
-           - put_object_acl(bucket, key, acl_xml: String) → Result&lt;()&gt;
-           - get_object_acl(bucket, key) → Result&lt;String&gt;
-
-           HTTP: PUT/GET /{bucket}/{key}?acl
-           Add ?acl dispatch to object handlers.
-
-        4. Lifecycle Configuration (XML):
-           Storage: {bucket}/.lifecycle.json (store raw XML as string)
-           - put_bucket_lifecycle(bucket, lifecycle_xml: String) → Result&lt;()&gt;
-           - get_bucket_lifecycle(bucket) → Result&lt;String&gt;
-           - delete_bucket_lifecycle(bucket) → Result&lt;()&gt;
-
-           HTTP: PUT/GET/DELETE /{bucket}?lifecycle
-           Add NoSuchLifecycleConfiguration error variant.
-
-        5. Update is_internal_entry for: .policy.json, .acl.json, .acls, .lifecycle.json
-
-        6. For all config storage: these are "accept and store" — no parsing, validation, or enforcement.
-           This makes implementation simple: just read/write files.
-
-        7. Add query param dispatch in routes/bucket.rs for policy, acl, lifecycle.
-           Add acl dispatch in routes/object.rs.
-
-        8. Unit tests for each config storage method.
-      </action>
-
-      <verification>
-        <command>cargo build</command>
-        <command>cargo test --lib</command>
-        <command>cargo clippy -- -D warnings</command>
-      </verification>
-
-      <done>
-        - Bucket policy CRUD works (raw JSON storage)
-        - Bucket ACL put/get works (raw XML storage)
-        - Object ACL put/get works
-        - Lifecycle config CRUD works (raw XML storage)
-        - All store-only — no enforcement
-        - All existing tests pass
-      </done>
-    </task>
-
-    <task id="3" type="test" complete="false">
-      <name>Integration tests for versioning and config storage</name>
-      <description>
-        AWS SDK integration tests for versioning operations and config storage APIs.
-      </description>
-
-      <files>
-        <create>tests/versioning_integration.rs — versioning tests</create>
-        <modify>tests/object_integration.rs — add config storage tests if needed</modify>
-      </files>
-
-      <action>
-        1. Versioning tests:
-           - test_enable_versioning: enable, verify status
-           - test_versioned_put: enable versioning, put same key twice, verify both versions exist
-           - test_get_specific_version: put 2 versions, get each by versionId
-           - test_delete_creates_marker: enable versioning, put, delete, verify 404 on GET
-           - test_delete_with_version_id: permanently remove specific version
-           - test_list_object_versions: put multiple versions, list, verify order
-
-        2. Config storage tests:
-           - test_put_get_bucket_policy: put JSON policy, get back
-           - test_put_get_bucket_acl: put ACL, get back
-           - test_put_get_lifecycle: put lifecycle config, get back
-      </action>
-
-      <verification>
+        <command>cargo build --release</command>
         <command>cargo test</command>
+        <manual>
+          docker build -t local-s3 .
+          docker run -p 4566:4566 -v ./data:/data local-s3
+          curl http://localhost:4566/_health → "healthy"
+          curl http://localhost:4566 → ListBuckets XML
+        </manual>
       </verification>
 
       <done>
-        - Versioning lifecycle fully tested via AWS SDK
-        - Config storage round-trip tested
-        - All tests passing
+        - Dockerfile builds successfully
+        - docker-compose.yml exists with volume mount
+        - Health check endpoint works
+        - --log-level CLI arg works
+        - All 189 tests still pass
+      </done>
+    </task>
+
+    <task id="2" type="setup" complete="false">
+      <name>GitHub Actions CI and README documentation</name>
+      <description>
+        Create GitHub Actions workflow for CI (build, test, clippy, fmt).
+        Write comprehensive README with quickstart, docker-compose example,
+        and SDK configuration snippets for AWS CLI, Node.js, Python, and Rust.
+      </description>
+
+      <files>
+        <create>.github/workflows/ci.yml      — CI pipeline: build, test, lint, Docker</create>
+        <modify>README.md                      — complete documentation</modify>
+        <modify>CLAUDE.md                      — update with final architecture</modify>
+      </files>
+
+      <action>
+        1. Create .github/workflows/ci.yml:
+           - Trigger on push to main and PRs
+           - Jobs:
+             a) check: cargo fmt --check, cargo clippy -- -D warnings
+             b) test: cargo test (with timeout)
+             c) build-release: cargo build --release
+             d) docker: docker build (only on main push)
+           - Use actions/checkout, dtolnay/rust-toolchain
+           - Cache cargo registry and target
+
+        2. Rewrite README.md:
+           - Project name + one-line description
+           - Why (LocalStack account requirement problem)
+           - Quickstart: docker run one-liner
+           - docker-compose example
+           - Binary usage (cargo install / cargo run)
+           - SDK Configuration snippets:
+             * AWS CLI: --endpoint-url http://localhost:4566
+             * Node.js (aws-sdk-v3): endpoint, forcePathStyle
+             * Python (boto3): endpoint_url
+             * Rust (aws-sdk-s3): endpoint_url, force_path_style
+           - Supported S3 Operations (table of what's implemented)
+           - Configuration (env vars, CLI args)
+           - Persistence (data directory, volume mounts)
+           - License (MIT)
+
+        3. Update CLAUDE.md with final architecture notes reflecting all 5 phases.
+      </action>
+
+      <verification>
+        <manual>
+          Review README.md for completeness
+          Review CI workflow for correctness
+          Verify CLAUDE.md is up to date
+        </manual>
+      </verification>
+
+      <done>
+        - CI workflow runs build, test, lint, Docker
+        - README has quickstart, SDK examples, feature table
+        - CLAUDE.md updated with final architecture
       </done>
     </task>
   </tasks>
 
   <phase_verification>
     <commands>
-      <command>cargo build</command>
+      <command>cargo build --release</command>
       <command>cargo test</command>
       <command>cargo fmt -- --check</command>
       <command>cargo clippy -- -D warnings</command>
     </commands>
+    <manual>
+      1. docker build -t local-s3 .
+      2. docker run -p 4566:4566 -v ./data:/data local-s3
+      3. curl http://localhost:4566/_health → healthy
+      4. AWS CLI: aws --endpoint-url http://localhost:4566 s3 mb s3://test
+      5. Verify README has all sections
+    </manual>
   </phase_verification>
 
   <completion_criteria>
-    <criterion>All 3 tasks marked complete</criterion>
-    <criterion>All verification commands pass</criterion>
-    <criterion>Versioning lifecycle works via AWS SDK</criterion>
-    <criterion>Config storage round-trips via AWS SDK</criterion>
-    <criterion>No TODO comments left in new code</criterion>
+    <criterion>Both tasks marked complete</criterion>
+    <criterion>Docker image builds and runs</criterion>
+    <criterion>CI workflow file exists and is valid</criterion>
+    <criterion>README covers quickstart, SDK config, feature table</criterion>
+    <criterion>All 189 tests still pass</criterion>
   </completion_criteria>
 </plan>
