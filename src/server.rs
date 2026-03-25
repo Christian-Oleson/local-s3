@@ -98,6 +98,10 @@ async fn cors_preflight_response(
     response
 }
 
+async fn health_handler() -> impl IntoResponse {
+    (StatusCode::OK, "healthy")
+}
+
 pub fn build_router(state: AppState) -> Router {
     let bucket_methods = put(bucket::create_bucket)
         .delete(bucket::delete_bucket)
@@ -107,6 +111,7 @@ pub fn build_router(state: AppState) -> Router {
         .options(options_bucket_handler);
 
     Router::new()
+        .route("/_health", get(health_handler))
         .route("/", get(bucket::list_buckets))
         .route("/{bucket_name}", bucket_methods.clone())
         .route("/{bucket_name}/", bucket_methods)

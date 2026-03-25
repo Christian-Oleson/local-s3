@@ -6,10 +6,19 @@ use local_s3::server;
 
 #[tokio::main]
 async fn main() {
+    let args: Vec<String> = std::env::args().collect();
+
+    // --log-level overrides the default; RUST_LOG overrides everything
+    let log_level: String = parse_arg(&args, "--log-level").unwrap_or_else(|| "info".to_string());
+    let directive = format!("local_s3={log_level}");
+
     tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::from_default_env().add_directive("local_s3=info".parse().unwrap()),
-        )
+        .with_env_filter(EnvFilter::from_default_env().add_directive(
+            directive.parse().unwrap_or_else(|_| {
+                eprintln!("Invalid log level '{log_level}', falling back to 'info'");
+                "local_s3=info".parse().unwrap()
+            }),
+        ))
         .init();
 
     let port: u16 = std::env::var("LOCAL_S3_PORT")
@@ -22,7 +31,6 @@ async fn main() {
         .unwrap_or_else(|_| PathBuf::from("./data"));
 
     // Also support --port and --data-dir CLI args
-    let args: Vec<String> = std::env::args().collect();
     let port = parse_arg(&args, "--port").unwrap_or(port);
     let data_dir = parse_arg::<String>(&args, "--data-dir")
         .map(PathBuf::from)
