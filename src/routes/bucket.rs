@@ -7,10 +7,12 @@ use serde::Deserialize;
 
 use crate::error::S3Error;
 use crate::server::AppState;
+use crate::storage::filesystem::CorsRule;
 use crate::types::xml::{
-    BucketEntry, Buckets, CommonPrefix, CreateBucketConfiguration, DeleteResult, DeletedEntry,
-    ListAllMyBucketsResult, ListObjectsV1Result, ListObjectsV2Result, LocationConstraintResponse,
-    ObjectEntry, Owner, S3_NAMESPACE,
+    BucketEntry, Buckets, CORSConfiguration, CORSRuleXml, CommonPrefix, CreateBucketConfiguration,
+    DeleteResult, DeletedEntry, ListAllMyBucketsResult, ListMultipartUploadsResult,
+    ListObjectsV1Result, ListObjectsV2Result, LocationConstraintResponse, ObjectEntry, Owner,
+    S3_NAMESPACE, UploadEntry,
 };
 
 fn xml_response(xml: String) -> Response {
@@ -42,11 +44,27 @@ pub async fn list_buckets(State(state): State<AppState>) -> Result<Response, S3E
     Ok(xml_response(xml))
 }
 
+#[derive(Debug, Deserialize, Default)]
+pub struct BucketPutQuery {
+    pub cors: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct BucketDeleteQuery {
+    pub cors: Option<String>,
+}
+
 pub async fn create_bucket(
     State(state): State<AppState>,
     Path(bucket_name): Path<String>,
+    Query(query): Query<BucketPutQuery>,
     body: Bytes,
 ) -> Result<Response, S3Error> {
+    // If ?cors is present, this is PutBucketCors
+    if query.cors.is_some() {
+        return handle_put_bucket_cors(&state, &bucket_name, &body).await;
+    }
+
     let region = if body.is_empty() {
         "us-east-1".to_string()
     } else {
@@ -72,7 +90,14 @@ pub async fn create_bucket(
 pub async fn delete_bucket(
     State(state): State<AppState>,
     Path(bucket_name): Path<String>,
+    Query(query): Query<BucketDeleteQuery>,
 ) -> Result<Response, S3Error> {
+    // If ?cors is present, this is DeleteBucketCors
+    if query.cors.is_some() {
+        state.storage.delete_bucket_cors(&bucket_name).await?;
+        return Ok(StatusCode::NO_CONTENT.into_response());
+    }
+
     state.storage.delete_bucket(&bucket_name).await?;
     Ok(StatusCode::NO_CONTENT.into_response())
 }
@@ -104,6 +129,8 @@ pub struct BucketGetQuery {
     #[serde(rename = "continuation-token")]
     pub continuation_token: Option<String>,
     pub marker: Option<String>,
+    pub uploads: Option<String>,
+    pub cors: Option<String>,
 }
 
 pub async fn get_bucket(
@@ -111,6 +138,16 @@ pub async fn get_bucket(
     Path(bucket_name): Path<String>,
     Query(query): Query<BucketGetQuery>,
 ) -> Result<Response, S3Error> {
+    // Check if this is a ?cors request (GetBucketCors)
+    if query.cors.is_some() {
+        return handle_get_bucket_cors(&state, &bucket_name).await;
+    }
+
+    // Check if this is a ?uploads request (ListMultipartUploads)
+    if query.uploads.is_some() {
+        return list_multipart_uploads_handler(state, &bucket_name).await;
+    }
+
     // Check if this is a ?location request
     // The AWS SDK sends ?location (with no value), so we check if the key exists
     // in the raw query string since serde will deserialize it as Some("")
@@ -271,6 +308,86 @@ async fn get_bucket_location(state: AppState, bucket_name: &str) -> Result<Respo
 
     let xml = to_xml_string(&loc).map_err(|e| S3Error::InternalError {
         message: format!("Failed to serialize response: {e}"),
+    })?;
+
+    Ok(xml_response(xml))
+}
+
+async fn list_multipart_uploads_handler(
+    state: AppState,
+    bucket_name: &str,
+) -> Result<Response, S3Error> {
+    let uploads = state.storage.list_multipart_uploads(bucket_name).await?;
+
+    let result = ListMultipartUploadsResult {
+        xmlns: S3_NAMESPACE.to_string(),
+        bucket: bucket_name.to_string(),
+        max_uploads: 1000,
+        is_truncated: false,
+        uploads: uploads
+            .into_iter()
+            .map(|u| UploadEntry {
+                key: u.key,
+                upload_id: u.upload_id,
+                initiated: u.initiated.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string(),
+            })
+            .collect(),
+    };
+
+    let xml = to_xml_string(&result).map_err(|e| S3Error::InternalError {
+        message: format!("Failed to serialize ListMultipartUploadsResult: {e}"),
+    })?;
+
+    Ok(xml_response(xml))
+}
+
+// --- CORS Configuration handlers ---
+
+async fn handle_put_bucket_cors(
+    state: &AppState,
+    bucket_name: &str,
+    body: &[u8],
+) -> Result<Response, S3Error> {
+    let config: CORSConfiguration =
+        quick_xml::de::from_reader(body).map_err(|e| S3Error::InternalError {
+            message: format!("Failed to parse CORSConfiguration XML: {e}"),
+        })?;
+
+    let rules: Vec<CorsRule> = config
+        .rules
+        .into_iter()
+        .map(|r| CorsRule {
+            allowed_origins: r.allowed_origin,
+            allowed_methods: r.allowed_method,
+            allowed_headers: r.allowed_header,
+            max_age_seconds: r.max_age_seconds,
+            expose_headers: r.expose_header,
+        })
+        .collect();
+
+    state.storage.put_bucket_cors(bucket_name, rules).await?;
+
+    Ok((StatusCode::OK, [("content-length", "0")], "").into_response())
+}
+
+async fn handle_get_bucket_cors(state: &AppState, bucket_name: &str) -> Result<Response, S3Error> {
+    let rules = state.storage.get_bucket_cors(bucket_name).await?;
+
+    let config = CORSConfiguration {
+        rules: rules
+            .into_iter()
+            .map(|r| CORSRuleXml {
+                allowed_origin: r.allowed_origins,
+                allowed_method: r.allowed_methods,
+                allowed_header: r.allowed_headers,
+                max_age_seconds: r.max_age_seconds,
+                expose_header: r.expose_headers,
+            })
+            .collect(),
+    };
+
+    let xml = to_xml_string(&config).map_err(|e| S3Error::InternalError {
+        message: format!("Failed to serialize CORSConfiguration: {e}"),
     })?;
 
     Ok(xml_response(xml))

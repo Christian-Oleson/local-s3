@@ -3,7 +3,9 @@ use std::path::PathBuf;
 
 use chrono::{DateTime, Utc};
 use md5::{Digest, Md5};
+use serde::{Deserialize, Serialize};
 use tokio::fs;
+use uuid::Uuid;
 
 use crate::error::S3Error;
 use crate::types::bucket::Bucket;
@@ -25,6 +27,31 @@ pub struct ObjectInfo {
     pub size: u64,
     pub etag: String,
     pub last_modified: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MultipartUploadState {
+    pub key: String,
+    pub upload_id: String,
+    pub initiated: DateTime<Utc>,
+    pub parts: HashMap<i32, PartInfo>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PartInfo {
+    pub part_number: i32,
+    pub etag: String,
+    pub size: u64,
+    pub last_modified: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CorsRule {
+    pub allowed_origins: Vec<String>,
+    pub allowed_methods: Vec<String>,
+    pub allowed_headers: Vec<String>,
+    pub max_age_seconds: Option<i32>,
+    pub expose_headers: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -199,7 +226,11 @@ impl FileSystemStorage {
     }
 
     fn is_internal_entry(name: &str) -> bool {
-        name == ".bucket-metadata.json" || name == ".meta"
+        name == ".bucket-metadata.json"
+            || name == ".meta"
+            || name == ".uploads"
+            || name == ".tags"
+            || name == ".cors.json"
     }
 
     // --- Object CRUD ---
@@ -348,10 +379,17 @@ impl FileSystemStorage {
             let _ = fs::remove_file(&meta_path).await;
         }
 
+        // Remove tags sidecar
+        let tags_path = self.tags_path(bucket, key);
+        if tags_path.is_file() {
+            let _ = fs::remove_file(&tags_path).await;
+        }
+
         // Clean up empty parent dirs (but not bucket dir itself)
         let bucket_path = self.bucket_path(bucket);
         self.cleanup_empty_parents(&obj_path, &bucket_path).await;
         self.cleanup_empty_parents(&meta_path, &bucket_path).await;
+        self.cleanup_empty_parents(&tags_path, &bucket_path).await;
 
         Ok(())
     }
@@ -560,6 +598,555 @@ impl FileSystemStorage {
         }
 
         Ok(deleted)
+    }
+
+    // --- Object Tagging ---
+
+    fn tags_path(&self, bucket: &str, key: &str) -> PathBuf {
+        self.bucket_path(bucket)
+            .join(".tags")
+            .join(format!("{key}.json"))
+    }
+
+    pub async fn put_object_tagging(
+        &self,
+        bucket: &str,
+        key: &str,
+        tags: HashMap<String, String>,
+    ) -> Result<(), S3Error> {
+        if !self.bucket_exists(bucket) {
+            return Err(S3Error::NoSuchBucket {
+                bucket_name: bucket.to_string(),
+            });
+        }
+
+        // Verify the object exists
+        let obj_path = self.object_path(bucket, key);
+        if !obj_path.is_file() {
+            return Err(S3Error::NoSuchKey {
+                key: key.to_string(),
+            });
+        }
+
+        let tags_path = self.tags_path(bucket, key);
+        if let Some(parent) = tags_path.parent() {
+            fs::create_dir_all(parent)
+                .await
+                .map_err(|e| S3Error::InternalError {
+                    message: format!("Failed to create tags directory: {e}"),
+                })?;
+        }
+
+        let json = serde_json::to_string_pretty(&tags).map_err(|e| S3Error::InternalError {
+            message: format!("Failed to serialize tags: {e}"),
+        })?;
+
+        fs::write(&tags_path, json)
+            .await
+            .map_err(|e| S3Error::InternalError {
+                message: format!("Failed to write tags: {e}"),
+            })?;
+
+        Ok(())
+    }
+
+    pub async fn get_object_tagging(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> Result<HashMap<String, String>, S3Error> {
+        if !self.bucket_exists(bucket) {
+            return Err(S3Error::NoSuchBucket {
+                bucket_name: bucket.to_string(),
+            });
+        }
+
+        // Verify the object exists
+        let obj_path = self.object_path(bucket, key);
+        if !obj_path.is_file() {
+            return Err(S3Error::NoSuchKey {
+                key: key.to_string(),
+            });
+        }
+
+        let tags_path = self.tags_path(bucket, key);
+        if !tags_path.is_file() {
+            return Ok(HashMap::new());
+        }
+
+        let content = fs::read_to_string(&tags_path)
+            .await
+            .map_err(|e| S3Error::InternalError {
+                message: format!("Failed to read tags: {e}"),
+            })?;
+
+        serde_json::from_str(&content).map_err(|e| S3Error::InternalError {
+            message: format!("Failed to parse tags: {e}"),
+        })
+    }
+
+    pub async fn delete_object_tagging(&self, bucket: &str, key: &str) -> Result<(), S3Error> {
+        if !self.bucket_exists(bucket) {
+            return Err(S3Error::NoSuchBucket {
+                bucket_name: bucket.to_string(),
+            });
+        }
+
+        // Verify the object exists
+        let obj_path = self.object_path(bucket, key);
+        if !obj_path.is_file() {
+            return Err(S3Error::NoSuchKey {
+                key: key.to_string(),
+            });
+        }
+
+        let tags_path = self.tags_path(bucket, key);
+        if tags_path.is_file() {
+            let _ = fs::remove_file(&tags_path).await;
+        }
+
+        // Cleanup empty parent dirs within .tags
+        let tags_dir = self.bucket_path(bucket).join(".tags");
+        self.cleanup_empty_parents(&tags_path, &tags_dir).await;
+
+        Ok(())
+    }
+
+    // --- CORS Configuration ---
+
+    fn cors_path(&self, bucket: &str) -> PathBuf {
+        self.bucket_path(bucket).join(".cors.json")
+    }
+
+    pub async fn put_bucket_cors(&self, bucket: &str, rules: Vec<CorsRule>) -> Result<(), S3Error> {
+        if !self.bucket_exists(bucket) {
+            return Err(S3Error::NoSuchBucket {
+                bucket_name: bucket.to_string(),
+            });
+        }
+
+        let json = serde_json::to_string_pretty(&rules).map_err(|e| S3Error::InternalError {
+            message: format!("Failed to serialize CORS rules: {e}"),
+        })?;
+
+        fs::write(self.cors_path(bucket), json)
+            .await
+            .map_err(|e| S3Error::InternalError {
+                message: format!("Failed to write CORS config: {e}"),
+            })?;
+
+        Ok(())
+    }
+
+    pub async fn get_bucket_cors(&self, bucket: &str) -> Result<Vec<CorsRule>, S3Error> {
+        if !self.bucket_exists(bucket) {
+            return Err(S3Error::NoSuchBucket {
+                bucket_name: bucket.to_string(),
+            });
+        }
+
+        let cors_path = self.cors_path(bucket);
+        if !cors_path.is_file() {
+            return Err(S3Error::NoSuchCORSConfiguration {
+                bucket_name: bucket.to_string(),
+            });
+        }
+
+        let content = fs::read_to_string(&cors_path)
+            .await
+            .map_err(|e| S3Error::InternalError {
+                message: format!("Failed to read CORS config: {e}"),
+            })?;
+
+        serde_json::from_str(&content).map_err(|e| S3Error::InternalError {
+            message: format!("Failed to parse CORS config: {e}"),
+        })
+    }
+
+    pub async fn delete_bucket_cors(&self, bucket: &str) -> Result<(), S3Error> {
+        if !self.bucket_exists(bucket) {
+            return Err(S3Error::NoSuchBucket {
+                bucket_name: bucket.to_string(),
+            });
+        }
+
+        let cors_path = self.cors_path(bucket);
+        if cors_path.is_file() {
+            let _ = fs::remove_file(&cors_path).await;
+        }
+
+        Ok(())
+    }
+
+    // --- Multipart upload ---
+
+    fn uploads_dir(&self, bucket: &str) -> PathBuf {
+        self.bucket_path(bucket).join(".uploads")
+    }
+
+    fn upload_dir(&self, bucket: &str, upload_id: &str) -> PathBuf {
+        self.uploads_dir(bucket).join(upload_id)
+    }
+
+    fn upload_state_path(&self, bucket: &str, upload_id: &str) -> PathBuf {
+        self.upload_dir(bucket, upload_id).join("state.json")
+    }
+
+    fn upload_part_path(&self, bucket: &str, upload_id: &str, part_number: i32) -> PathBuf {
+        self.upload_dir(bucket, upload_id)
+            .join(format!("{part_number}.part"))
+    }
+
+    pub async fn create_multipart_upload(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> Result<String, S3Error> {
+        if !self.bucket_exists(bucket) {
+            return Err(S3Error::NoSuchBucket {
+                bucket_name: bucket.to_string(),
+            });
+        }
+
+        let upload_id = Uuid::new_v4().to_string();
+        let upload_dir = self.upload_dir(bucket, &upload_id);
+
+        fs::create_dir_all(&upload_dir)
+            .await
+            .map_err(|e| S3Error::InternalError {
+                message: format!("Failed to create upload directory: {e}"),
+            })?;
+
+        let state = MultipartUploadState {
+            key: key.to_string(),
+            upload_id: upload_id.clone(),
+            initiated: Utc::now(),
+            parts: HashMap::new(),
+        };
+
+        let state_json =
+            serde_json::to_string_pretty(&state).map_err(|e| S3Error::InternalError {
+                message: format!("Failed to serialize upload state: {e}"),
+            })?;
+
+        fs::write(self.upload_state_path(bucket, &upload_id), state_json)
+            .await
+            .map_err(|e| S3Error::InternalError {
+                message: format!("Failed to write upload state: {e}"),
+            })?;
+
+        Ok(upload_id)
+    }
+
+    pub async fn upload_part(
+        &self,
+        bucket: &str,
+        upload_id: &str,
+        part_number: i32,
+        body: &[u8],
+    ) -> Result<String, S3Error> {
+        if !self.bucket_exists(bucket) {
+            return Err(S3Error::NoSuchBucket {
+                bucket_name: bucket.to_string(),
+            });
+        }
+
+        if !(1..=10000).contains(&part_number) {
+            return Err(S3Error::InvalidPart {
+                message: format!("Part number must be between 1 and 10000, got {part_number}"),
+            });
+        }
+
+        let state_path = self.upload_state_path(bucket, upload_id);
+        if !state_path.is_file() {
+            return Err(S3Error::NoSuchUpload {
+                upload_id: upload_id.to_string(),
+            });
+        }
+
+        // Compute ETag (quoted hex MD5 of part data)
+        let mut hasher = Md5::new();
+        hasher.update(body);
+        let digest = hasher.finalize();
+        let etag = format!("\"{}\"", hex::encode(digest));
+
+        // Write part data
+        let part_path = self.upload_part_path(bucket, upload_id, part_number);
+        fs::write(&part_path, body)
+            .await
+            .map_err(|e| S3Error::InternalError {
+                message: format!("Failed to write part data: {e}"),
+            })?;
+
+        // Update state
+        let content =
+            fs::read_to_string(&state_path)
+                .await
+                .map_err(|e| S3Error::InternalError {
+                    message: format!("Failed to read upload state: {e}"),
+                })?;
+
+        let mut state: MultipartUploadState =
+            serde_json::from_str(&content).map_err(|e| S3Error::InternalError {
+                message: format!("Failed to parse upload state: {e}"),
+            })?;
+
+        state.parts.insert(
+            part_number,
+            PartInfo {
+                part_number,
+                etag: etag.clone(),
+                size: body.len() as u64,
+                last_modified: Utc::now(),
+            },
+        );
+
+        let state_json =
+            serde_json::to_string_pretty(&state).map_err(|e| S3Error::InternalError {
+                message: format!("Failed to serialize upload state: {e}"),
+            })?;
+
+        fs::write(&state_path, state_json)
+            .await
+            .map_err(|e| S3Error::InternalError {
+                message: format!("Failed to write upload state: {e}"),
+            })?;
+
+        Ok(etag)
+    }
+
+    pub async fn complete_multipart_upload(
+        &self,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+        parts: Vec<(i32, String)>,
+    ) -> Result<ObjectMetadata, S3Error> {
+        if !self.bucket_exists(bucket) {
+            return Err(S3Error::NoSuchBucket {
+                bucket_name: bucket.to_string(),
+            });
+        }
+
+        let state_path = self.upload_state_path(bucket, upload_id);
+        if !state_path.is_file() {
+            return Err(S3Error::NoSuchUpload {
+                upload_id: upload_id.to_string(),
+            });
+        }
+
+        let content =
+            fs::read_to_string(&state_path)
+                .await
+                .map_err(|e| S3Error::InternalError {
+                    message: format!("Failed to read upload state: {e}"),
+                })?;
+
+        let state: MultipartUploadState =
+            serde_json::from_str(&content).map_err(|e| S3Error::InternalError {
+                message: format!("Failed to parse upload state: {e}"),
+            })?;
+
+        // Validate all parts exist and ETags match
+        for (part_number, etag) in &parts {
+            let part_info = state.parts.get(part_number).ok_or(S3Error::InvalidPart {
+                message: format!("Part {part_number} not found in upload {upload_id}"),
+            })?;
+
+            if part_info.etag != *etag {
+                return Err(S3Error::InvalidPart {
+                    message: format!(
+                        "ETag mismatch for part {part_number}: expected {}, got {}",
+                        part_info.etag, etag
+                    ),
+                });
+            }
+        }
+
+        // Read and concatenate part data in order
+        let mut assembled = Vec::new();
+        let mut raw_md5_bytes = Vec::new();
+
+        for (part_number, _etag) in &parts {
+            let part_path = self.upload_part_path(bucket, upload_id, *part_number);
+            let part_data = fs::read(&part_path)
+                .await
+                .map_err(|e| S3Error::InternalError {
+                    message: format!("Failed to read part {part_number}: {e}"),
+                })?;
+
+            // Compute MD5 of this part's data for composite ETag
+            let mut hasher = Md5::new();
+            hasher.update(&part_data);
+            let part_md5 = hasher.finalize();
+            raw_md5_bytes.extend_from_slice(&part_md5);
+
+            assembled.extend_from_slice(&part_data);
+        }
+
+        // Compute composite ETag: MD5(concatenated raw MD5 bytes)-N
+        let mut composite_hasher = Md5::new();
+        composite_hasher.update(&raw_md5_bytes);
+        let composite_digest = composite_hasher.finalize();
+        let composite_etag = format!("\"{}-{}\"", hex::encode(composite_digest), parts.len());
+
+        // Write the assembled body using put_object logic
+        let obj_path = self.object_path(bucket, key);
+        if let Some(parent) = obj_path.parent() {
+            fs::create_dir_all(parent)
+                .await
+                .map_err(|e| S3Error::InternalError {
+                    message: format!("Failed to create parent directories for object: {e}"),
+                })?;
+        }
+
+        fs::write(&obj_path, &assembled)
+            .await
+            .map_err(|e| S3Error::InternalError {
+                message: format!("Failed to write assembled object: {e}"),
+            })?;
+
+        let metadata = ObjectMetadata {
+            key: key.to_string(),
+            content_type: "application/octet-stream".to_string(),
+            content_length: assembled.len() as u64,
+            etag: composite_etag,
+            last_modified: Utc::now(),
+            custom_metadata: HashMap::new(),
+            content_disposition: None,
+            cache_control: None,
+            content_encoding: None,
+            expires: None,
+        };
+
+        // Write metadata sidecar
+        let meta_path = self.object_metadata_path(bucket, key);
+        if let Some(parent) = meta_path.parent() {
+            fs::create_dir_all(parent)
+                .await
+                .map_err(|e| S3Error::InternalError {
+                    message: format!("Failed to create metadata directory: {e}"),
+                })?;
+        }
+
+        let metadata_json =
+            serde_json::to_string_pretty(&metadata).map_err(|e| S3Error::InternalError {
+                message: format!("Failed to serialize object metadata: {e}"),
+            })?;
+
+        fs::write(&meta_path, metadata_json)
+            .await
+            .map_err(|e| S3Error::InternalError {
+                message: format!("Failed to write object metadata: {e}"),
+            })?;
+
+        // Clean up upload directory
+        let upload_dir = self.upload_dir(bucket, upload_id);
+        let _ = fs::remove_dir_all(&upload_dir).await;
+
+        Ok(metadata)
+    }
+
+    pub async fn abort_multipart_upload(
+        &self,
+        bucket: &str,
+        upload_id: &str,
+    ) -> Result<(), S3Error> {
+        if !self.bucket_exists(bucket) {
+            return Err(S3Error::NoSuchBucket {
+                bucket_name: bucket.to_string(),
+            });
+        }
+
+        let upload_dir = self.upload_dir(bucket, upload_id);
+        if !upload_dir.is_dir() {
+            return Err(S3Error::NoSuchUpload {
+                upload_id: upload_id.to_string(),
+            });
+        }
+
+        fs::remove_dir_all(&upload_dir)
+            .await
+            .map_err(|e| S3Error::InternalError {
+                message: format!("Failed to remove upload directory: {e}"),
+            })?;
+
+        Ok(())
+    }
+
+    pub async fn list_parts(
+        &self,
+        bucket: &str,
+        upload_id: &str,
+    ) -> Result<MultipartUploadState, S3Error> {
+        if !self.bucket_exists(bucket) {
+            return Err(S3Error::NoSuchBucket {
+                bucket_name: bucket.to_string(),
+            });
+        }
+
+        let state_path = self.upload_state_path(bucket, upload_id);
+        if !state_path.is_file() {
+            return Err(S3Error::NoSuchUpload {
+                upload_id: upload_id.to_string(),
+            });
+        }
+
+        let content =
+            fs::read_to_string(&state_path)
+                .await
+                .map_err(|e| S3Error::InternalError {
+                    message: format!("Failed to read upload state: {e}"),
+                })?;
+
+        serde_json::from_str(&content).map_err(|e| S3Error::InternalError {
+            message: format!("Failed to parse upload state: {e}"),
+        })
+    }
+
+    pub async fn list_multipart_uploads(
+        &self,
+        bucket: &str,
+    ) -> Result<Vec<MultipartUploadState>, S3Error> {
+        if !self.bucket_exists(bucket) {
+            return Err(S3Error::NoSuchBucket {
+                bucket_name: bucket.to_string(),
+            });
+        }
+
+        let uploads_dir = self.uploads_dir(bucket);
+        if !uploads_dir.is_dir() {
+            return Ok(Vec::new());
+        }
+
+        let mut uploads = Vec::new();
+        let mut entries = fs::read_dir(&uploads_dir)
+            .await
+            .map_err(|e| S3Error::InternalError {
+                message: format!("Failed to read uploads directory: {e}"),
+            })?;
+
+        while let Some(entry) = entries
+            .next_entry()
+            .await
+            .map_err(|e| S3Error::InternalError {
+                message: format!("Failed to read upload entry: {e}"),
+            })?
+        {
+            let path = entry.path();
+            if path.is_dir() {
+                let state_path = path.join("state.json");
+                if state_path.is_file()
+                    && let Ok(content) = fs::read_to_string(&state_path).await
+                    && let Ok(state) = serde_json::from_str::<MultipartUploadState>(&content)
+                {
+                    uploads.push(state);
+                }
+            }
+        }
+
+        uploads.sort_by(|a, b| a.initiated.cmp(&b.initiated));
+        Ok(uploads)
     }
 
     // --- Private helpers ---
@@ -1440,5 +2027,755 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, S3Error::NoSuchBucket { .. }));
+    }
+
+    // --- Multipart upload tests ---
+
+    #[tokio::test]
+    async fn test_create_multipart_upload() {
+        let (storage, _tmp) = test_storage().await;
+        create_test_bucket(&storage).await;
+
+        let upload_id = storage
+            .create_multipart_upload("test-bucket", "large-file.bin")
+            .await
+            .unwrap();
+
+        assert!(!upload_id.is_empty());
+
+        // Verify state file was created
+        let state = storage.list_parts("test-bucket", &upload_id).await.unwrap();
+        assert_eq!(state.key, "large-file.bin");
+        assert_eq!(state.upload_id, upload_id);
+        assert!(state.parts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_create_multipart_upload_no_bucket() {
+        let (storage, _tmp) = test_storage().await;
+
+        let err = storage
+            .create_multipart_upload("nonexistent", "key.bin")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, S3Error::NoSuchBucket { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_upload_part() {
+        let (storage, _tmp) = test_storage().await;
+        create_test_bucket(&storage).await;
+
+        let upload_id = storage
+            .create_multipart_upload("test-bucket", "file.bin")
+            .await
+            .unwrap();
+
+        let etag1 = storage
+            .upload_part("test-bucket", &upload_id, 1, b"part one data")
+            .await
+            .unwrap();
+
+        let etag2 = storage
+            .upload_part("test-bucket", &upload_id, 2, b"part two data")
+            .await
+            .unwrap();
+
+        assert!(etag1.starts_with('"') && etag1.ends_with('"'));
+        assert!(etag2.starts_with('"') && etag2.ends_with('"'));
+        assert_ne!(etag1, etag2);
+
+        // Verify parts recorded in state
+        let state = storage.list_parts("test-bucket", &upload_id).await.unwrap();
+        assert_eq!(state.parts.len(), 2);
+        assert_eq!(state.parts[&1].etag, etag1);
+        assert_eq!(state.parts[&2].etag, etag2);
+    }
+
+    #[tokio::test]
+    async fn test_upload_part_invalid_number() {
+        let (storage, _tmp) = test_storage().await;
+        create_test_bucket(&storage).await;
+
+        let upload_id = storage
+            .create_multipart_upload("test-bucket", "file.bin")
+            .await
+            .unwrap();
+
+        let err = storage
+            .upload_part("test-bucket", &upload_id, 0, b"data")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, S3Error::InvalidPart { .. }));
+
+        let err = storage
+            .upload_part("test-bucket", &upload_id, 10001, b"data")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, S3Error::InvalidPart { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_upload_part_no_such_upload() {
+        let (storage, _tmp) = test_storage().await;
+        create_test_bucket(&storage).await;
+
+        let err = storage
+            .upload_part("test-bucket", "nonexistent-upload-id", 1, b"data")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, S3Error::NoSuchUpload { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_complete_multipart_upload() {
+        let (storage, _tmp) = test_storage().await;
+        create_test_bucket(&storage).await;
+
+        let upload_id = storage
+            .create_multipart_upload("test-bucket", "assembled.bin")
+            .await
+            .unwrap();
+
+        let etag1 = storage
+            .upload_part("test-bucket", &upload_id, 1, b"hello ")
+            .await
+            .unwrap();
+
+        let etag2 = storage
+            .upload_part("test-bucket", &upload_id, 2, b"world")
+            .await
+            .unwrap();
+
+        let metadata = storage
+            .complete_multipart_upload(
+                "test-bucket",
+                "assembled.bin",
+                &upload_id,
+                vec![(1, etag1), (2, etag2)],
+            )
+            .await
+            .unwrap();
+
+        // Check composite ETag format: "hex-N"
+        assert!(metadata.etag.starts_with('"'));
+        assert!(metadata.etag.ends_with('"'));
+        let inner = &metadata.etag[1..metadata.etag.len() - 1];
+        assert!(inner.ends_with("-2"), "ETag should end with -2: {inner}");
+
+        // Verify assembled content
+        let (_, body) = storage
+            .get_object("test-bucket", "assembled.bin")
+            .await
+            .unwrap();
+        assert_eq!(body, b"hello world");
+
+        // Upload directory should be cleaned up
+        let upload_dir = storage.upload_dir("test-bucket", &upload_id);
+        assert!(!upload_dir.exists());
+    }
+
+    #[tokio::test]
+    async fn test_complete_multipart_upload_etag_format() {
+        let (storage, _tmp) = test_storage().await;
+        create_test_bucket(&storage).await;
+
+        let upload_id = storage
+            .create_multipart_upload("test-bucket", "etag-test.bin")
+            .await
+            .unwrap();
+
+        let part1_data = b"aaaa";
+        let part2_data = b"bbbb";
+        let part3_data = b"cccc";
+
+        let etag1 = storage
+            .upload_part("test-bucket", &upload_id, 1, part1_data)
+            .await
+            .unwrap();
+        let etag2 = storage
+            .upload_part("test-bucket", &upload_id, 2, part2_data)
+            .await
+            .unwrap();
+        let etag3 = storage
+            .upload_part("test-bucket", &upload_id, 3, part3_data)
+            .await
+            .unwrap();
+
+        let metadata = storage
+            .complete_multipart_upload(
+                "test-bucket",
+                "etag-test.bin",
+                &upload_id,
+                vec![(1, etag1), (2, etag2), (3, etag3)],
+            )
+            .await
+            .unwrap();
+
+        // Manually compute expected composite ETag
+        use md5::{Digest, Md5};
+        let md5_1 = {
+            let mut h = Md5::new();
+            h.update(part1_data);
+            h.finalize()
+        };
+        let md5_2 = {
+            let mut h = Md5::new();
+            h.update(part2_data);
+            h.finalize()
+        };
+        let md5_3 = {
+            let mut h = Md5::new();
+            h.update(part3_data);
+            h.finalize()
+        };
+
+        let mut combined = Vec::new();
+        combined.extend_from_slice(&md5_1);
+        combined.extend_from_slice(&md5_2);
+        combined.extend_from_slice(&md5_3);
+
+        let mut composite_hasher = Md5::new();
+        composite_hasher.update(&combined);
+        let expected = format!("\"{}-3\"", hex::encode(composite_hasher.finalize()));
+
+        assert_eq!(metadata.etag, expected);
+    }
+
+    #[tokio::test]
+    async fn test_complete_multipart_upload_invalid_part() {
+        let (storage, _tmp) = test_storage().await;
+        create_test_bucket(&storage).await;
+
+        let upload_id = storage
+            .create_multipart_upload("test-bucket", "file.bin")
+            .await
+            .unwrap();
+
+        let etag1 = storage
+            .upload_part("test-bucket", &upload_id, 1, b"data")
+            .await
+            .unwrap();
+
+        // Try to complete with a part that doesn't exist
+        let err = storage
+            .complete_multipart_upload(
+                "test-bucket",
+                "file.bin",
+                &upload_id,
+                vec![(1, etag1), (2, "\"fake-etag\"".to_string())],
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, S3Error::InvalidPart { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_complete_multipart_upload_etag_mismatch() {
+        let (storage, _tmp) = test_storage().await;
+        create_test_bucket(&storage).await;
+
+        let upload_id = storage
+            .create_multipart_upload("test-bucket", "file.bin")
+            .await
+            .unwrap();
+
+        let _etag1 = storage
+            .upload_part("test-bucket", &upload_id, 1, b"data")
+            .await
+            .unwrap();
+
+        // Try to complete with wrong ETag
+        let err = storage
+            .complete_multipart_upload(
+                "test-bucket",
+                "file.bin",
+                &upload_id,
+                vec![(1, "\"wrong-etag\"".to_string())],
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, S3Error::InvalidPart { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_abort_multipart_upload() {
+        let (storage, _tmp) = test_storage().await;
+        create_test_bucket(&storage).await;
+
+        let upload_id = storage
+            .create_multipart_upload("test-bucket", "file.bin")
+            .await
+            .unwrap();
+
+        storage
+            .upload_part("test-bucket", &upload_id, 1, b"data")
+            .await
+            .unwrap();
+
+        storage
+            .abort_multipart_upload("test-bucket", &upload_id)
+            .await
+            .unwrap();
+
+        // Upload should no longer exist
+        let err = storage
+            .list_parts("test-bucket", &upload_id)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, S3Error::NoSuchUpload { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_abort_multipart_upload_no_such_upload() {
+        let (storage, _tmp) = test_storage().await;
+        create_test_bucket(&storage).await;
+
+        let err = storage
+            .abort_multipart_upload("test-bucket", "nonexistent")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, S3Error::NoSuchUpload { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_list_parts() {
+        let (storage, _tmp) = test_storage().await;
+        create_test_bucket(&storage).await;
+
+        let upload_id = storage
+            .create_multipart_upload("test-bucket", "file.bin")
+            .await
+            .unwrap();
+
+        storage
+            .upload_part("test-bucket", &upload_id, 1, b"part1")
+            .await
+            .unwrap();
+        storage
+            .upload_part("test-bucket", &upload_id, 3, b"part3")
+            .await
+            .unwrap();
+        storage
+            .upload_part("test-bucket", &upload_id, 2, b"part2")
+            .await
+            .unwrap();
+
+        let state = storage.list_parts("test-bucket", &upload_id).await.unwrap();
+        assert_eq!(state.parts.len(), 3);
+        assert_eq!(state.parts[&1].size, 5);
+        assert_eq!(state.parts[&2].size, 5);
+        assert_eq!(state.parts[&3].size, 5);
+    }
+
+    #[tokio::test]
+    async fn test_list_multipart_uploads() {
+        let (storage, _tmp) = test_storage().await;
+        create_test_bucket(&storage).await;
+
+        let id1 = storage
+            .create_multipart_upload("test-bucket", "file1.bin")
+            .await
+            .unwrap();
+        let id2 = storage
+            .create_multipart_upload("test-bucket", "file2.bin")
+            .await
+            .unwrap();
+
+        let uploads = storage.list_multipart_uploads("test-bucket").await.unwrap();
+        assert_eq!(uploads.len(), 2);
+
+        let ids: Vec<&str> = uploads.iter().map(|u| u.upload_id.as_str()).collect();
+        assert!(ids.contains(&id1.as_str()));
+        assert!(ids.contains(&id2.as_str()));
+    }
+
+    #[tokio::test]
+    async fn test_list_multipart_uploads_empty() {
+        let (storage, _tmp) = test_storage().await;
+        create_test_bucket(&storage).await;
+
+        let uploads = storage.list_multipart_uploads("test-bucket").await.unwrap();
+        assert!(uploads.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_list_multipart_uploads_no_bucket() {
+        let (storage, _tmp) = test_storage().await;
+
+        let err = storage
+            .list_multipart_uploads("nonexistent")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, S3Error::NoSuchBucket { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_upload_part_overwrite() {
+        let (storage, _tmp) = test_storage().await;
+        create_test_bucket(&storage).await;
+
+        let upload_id = storage
+            .create_multipart_upload("test-bucket", "file.bin")
+            .await
+            .unwrap();
+
+        let etag1 = storage
+            .upload_part("test-bucket", &upload_id, 1, b"original data")
+            .await
+            .unwrap();
+
+        let etag2 = storage
+            .upload_part("test-bucket", &upload_id, 1, b"replaced data")
+            .await
+            .unwrap();
+
+        // ETags should differ since data is different
+        assert_ne!(etag1, etag2);
+
+        // State should reflect the latest upload
+        let state = storage.list_parts("test-bucket", &upload_id).await.unwrap();
+        assert_eq!(state.parts.len(), 1);
+        assert_eq!(state.parts[&1].etag, etag2);
+    }
+
+    #[tokio::test]
+    async fn test_delete_bucket_with_uploads_dir_only() {
+        let (storage, _tmp) = test_storage().await;
+        create_test_bucket(&storage).await;
+
+        // Create and abort a multipart upload to leave .uploads dir
+        let upload_id = storage
+            .create_multipart_upload("test-bucket", "file.bin")
+            .await
+            .unwrap();
+        storage
+            .abort_multipart_upload("test-bucket", &upload_id)
+            .await
+            .unwrap();
+
+        // Ensure .uploads dir exists for this test
+        let uploads_dir = storage.uploads_dir("test-bucket");
+        tokio::fs::create_dir_all(&uploads_dir).await.unwrap();
+
+        // Delete bucket should succeed since only internal entries remain
+        storage.delete_bucket("test-bucket").await.unwrap();
+        assert!(!storage.bucket_exists("test-bucket"));
+    }
+
+    #[tokio::test]
+    async fn test_is_internal_entry_uploads() {
+        assert!(FileSystemStorage::is_internal_entry(".uploads"));
+    }
+
+    #[tokio::test]
+    async fn test_complete_multipart_upload_no_such_upload() {
+        let (storage, _tmp) = test_storage().await;
+        create_test_bucket(&storage).await;
+
+        let err = storage
+            .complete_multipart_upload(
+                "test-bucket",
+                "file.bin",
+                "nonexistent",
+                vec![(1, "\"etag\"".to_string())],
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, S3Error::NoSuchUpload { .. }));
+    }
+
+    // --- Object Tagging tests ---
+
+    #[tokio::test]
+    async fn test_put_and_get_object_tagging() {
+        let (storage, _tmp) = test_storage().await;
+        create_test_bucket(&storage).await;
+        put_test_object(&storage, "tagged.txt").await;
+
+        let mut tags = HashMap::new();
+        tags.insert("env".to_string(), "production".to_string());
+        tags.insert("project".to_string(), "test".to_string());
+
+        storage
+            .put_object_tagging("test-bucket", "tagged.txt", tags)
+            .await
+            .unwrap();
+
+        let got_tags = storage
+            .get_object_tagging("test-bucket", "tagged.txt")
+            .await
+            .unwrap();
+
+        assert_eq!(got_tags.len(), 2);
+        assert_eq!(got_tags.get("env").unwrap(), "production");
+        assert_eq!(got_tags.get("project").unwrap(), "test");
+    }
+
+    #[tokio::test]
+    async fn test_get_object_tagging_empty() {
+        let (storage, _tmp) = test_storage().await;
+        create_test_bucket(&storage).await;
+        put_test_object(&storage, "untagged.txt").await;
+
+        let tags = storage
+            .get_object_tagging("test-bucket", "untagged.txt")
+            .await
+            .unwrap();
+        assert!(tags.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_delete_object_tagging() {
+        let (storage, _tmp) = test_storage().await;
+        create_test_bucket(&storage).await;
+        put_test_object(&storage, "tagged.txt").await;
+
+        let mut tags = HashMap::new();
+        tags.insert("key".to_string(), "value".to_string());
+        storage
+            .put_object_tagging("test-bucket", "tagged.txt", tags)
+            .await
+            .unwrap();
+
+        storage
+            .delete_object_tagging("test-bucket", "tagged.txt")
+            .await
+            .unwrap();
+
+        let got_tags = storage
+            .get_object_tagging("test-bucket", "tagged.txt")
+            .await
+            .unwrap();
+        assert!(got_tags.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_tagging_no_such_key() {
+        let (storage, _tmp) = test_storage().await;
+        create_test_bucket(&storage).await;
+
+        let err = storage
+            .put_object_tagging("test-bucket", "missing.txt", HashMap::new())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, S3Error::NoSuchKey { .. }));
+
+        let err = storage
+            .get_object_tagging("test-bucket", "missing.txt")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, S3Error::NoSuchKey { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_tagging_no_such_bucket() {
+        let (storage, _tmp) = test_storage().await;
+
+        let err = storage
+            .put_object_tagging("no-bucket", "key.txt", HashMap::new())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, S3Error::NoSuchBucket { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_delete_object_removes_tags() {
+        let (storage, _tmp) = test_storage().await;
+        create_test_bucket(&storage).await;
+        put_test_object(&storage, "tagged.txt").await;
+
+        let mut tags = HashMap::new();
+        tags.insert("key".to_string(), "value".to_string());
+        storage
+            .put_object_tagging("test-bucket", "tagged.txt", tags)
+            .await
+            .unwrap();
+
+        // Delete the object
+        storage
+            .delete_object("test-bucket", "tagged.txt")
+            .await
+            .unwrap();
+
+        // Tags file should be gone (object no longer exists, so get_tagging should fail)
+        let tags_path = storage.tags_path("test-bucket", "tagged.txt");
+        assert!(!tags_path.exists());
+    }
+
+    #[tokio::test]
+    async fn test_put_object_tagging_overwrite() {
+        let (storage, _tmp) = test_storage().await;
+        create_test_bucket(&storage).await;
+        put_test_object(&storage, "tagged.txt").await;
+
+        let mut tags1 = HashMap::new();
+        tags1.insert("version".to_string(), "1".to_string());
+        storage
+            .put_object_tagging("test-bucket", "tagged.txt", tags1)
+            .await
+            .unwrap();
+
+        let mut tags2 = HashMap::new();
+        tags2.insert("version".to_string(), "2".to_string());
+        tags2.insert("extra".to_string(), "new".to_string());
+        storage
+            .put_object_tagging("test-bucket", "tagged.txt", tags2)
+            .await
+            .unwrap();
+
+        let got = storage
+            .get_object_tagging("test-bucket", "tagged.txt")
+            .await
+            .unwrap();
+        assert_eq!(got.len(), 2);
+        assert_eq!(got.get("version").unwrap(), "2");
+        assert_eq!(got.get("extra").unwrap(), "new");
+    }
+
+    // --- CORS Configuration tests ---
+
+    #[tokio::test]
+    async fn test_put_and_get_bucket_cors() {
+        let (storage, _tmp) = test_storage().await;
+        create_test_bucket(&storage).await;
+
+        let rules = vec![CorsRule {
+            allowed_origins: vec!["http://example.com".to_string()],
+            allowed_methods: vec!["GET".to_string(), "PUT".to_string()],
+            allowed_headers: vec!["*".to_string()],
+            max_age_seconds: Some(3600),
+            expose_headers: vec!["x-amz-request-id".to_string()],
+        }];
+
+        storage.put_bucket_cors("test-bucket", rules).await.unwrap();
+
+        let got = storage.get_bucket_cors("test-bucket").await.unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].allowed_origins, vec!["http://example.com"]);
+        assert_eq!(got[0].allowed_methods, vec!["GET", "PUT"]);
+        assert_eq!(got[0].allowed_headers, vec!["*"]);
+        assert_eq!(got[0].max_age_seconds, Some(3600));
+        assert_eq!(got[0].expose_headers, vec!["x-amz-request-id"]);
+    }
+
+    #[tokio::test]
+    async fn test_get_bucket_cors_not_configured() {
+        let (storage, _tmp) = test_storage().await;
+        create_test_bucket(&storage).await;
+
+        let err = storage.get_bucket_cors("test-bucket").await.unwrap_err();
+        assert!(matches!(err, S3Error::NoSuchCORSConfiguration { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_delete_bucket_cors() {
+        let (storage, _tmp) = test_storage().await;
+        create_test_bucket(&storage).await;
+
+        let rules = vec![CorsRule {
+            allowed_origins: vec!["*".to_string()],
+            allowed_methods: vec!["GET".to_string()],
+            allowed_headers: vec![],
+            max_age_seconds: None,
+            expose_headers: vec![],
+        }];
+
+        storage.put_bucket_cors("test-bucket", rules).await.unwrap();
+
+        storage.delete_bucket_cors("test-bucket").await.unwrap();
+
+        let err = storage.get_bucket_cors("test-bucket").await.unwrap_err();
+        assert!(matches!(err, S3Error::NoSuchCORSConfiguration { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_cors_no_such_bucket() {
+        let (storage, _tmp) = test_storage().await;
+
+        let err = storage
+            .put_bucket_cors("no-bucket", vec![])
+            .await
+            .unwrap_err();
+        assert!(matches!(err, S3Error::NoSuchBucket { .. }));
+
+        let err = storage.get_bucket_cors("no-bucket").await.unwrap_err();
+        assert!(matches!(err, S3Error::NoSuchBucket { .. }));
+
+        let err = storage.delete_bucket_cors("no-bucket").await.unwrap_err();
+        assert!(matches!(err, S3Error::NoSuchBucket { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_delete_bucket_cors_idempotent() {
+        let (storage, _tmp) = test_storage().await;
+        create_test_bucket(&storage).await;
+
+        // Deleting CORS when none exists should succeed
+        storage.delete_bucket_cors("test-bucket").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_is_internal_entry_tags() {
+        assert!(FileSystemStorage::is_internal_entry(".tags"));
+    }
+
+    #[tokio::test]
+    async fn test_is_internal_entry_cors() {
+        assert!(FileSystemStorage::is_internal_entry(".cors.json"));
+    }
+
+    #[tokio::test]
+    async fn test_delete_bucket_with_cors_and_tags() {
+        let (storage, _tmp) = test_storage().await;
+        create_test_bucket(&storage).await;
+
+        // Set CORS config
+        let rules = vec![CorsRule {
+            allowed_origins: vec!["*".to_string()],
+            allowed_methods: vec!["GET".to_string()],
+            allowed_headers: vec![],
+            max_age_seconds: None,
+            expose_headers: vec![],
+        }];
+        storage.put_bucket_cors("test-bucket", rules).await.unwrap();
+
+        // Create .tags dir for good measure
+        let tags_dir = storage.bucket_path("test-bucket").join(".tags");
+        tokio::fs::create_dir_all(&tags_dir).await.unwrap();
+
+        // Delete bucket should succeed since only internal entries remain
+        storage.delete_bucket("test-bucket").await.unwrap();
+        assert!(!storage.bucket_exists("test-bucket"));
+    }
+
+    #[tokio::test]
+    async fn test_put_bucket_cors_multiple_rules() {
+        let (storage, _tmp) = test_storage().await;
+        create_test_bucket(&storage).await;
+
+        let rules = vec![
+            CorsRule {
+                allowed_origins: vec!["http://app.example.com".to_string()],
+                allowed_methods: vec!["GET".to_string()],
+                allowed_headers: vec![],
+                max_age_seconds: None,
+                expose_headers: vec![],
+            },
+            CorsRule {
+                allowed_origins: vec!["http://admin.example.com".to_string()],
+                allowed_methods: vec!["GET".to_string(), "PUT".to_string(), "DELETE".to_string()],
+                allowed_headers: vec!["Authorization".to_string()],
+                max_age_seconds: Some(86400),
+                expose_headers: vec![],
+            },
+        ];
+
+        storage.put_bucket_cors("test-bucket", rules).await.unwrap();
+
+        let got = storage.get_bucket_cors("test-bucket").await.unwrap();
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].allowed_origins, vec!["http://app.example.com"]);
+        assert_eq!(got[1].allowed_methods.len(), 3);
     }
 }

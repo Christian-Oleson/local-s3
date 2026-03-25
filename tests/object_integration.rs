@@ -7,6 +7,8 @@ use aws_sdk_s3::Client;
 use aws_sdk_s3::config::retry::RetryConfig;
 use aws_sdk_s3::config::{BehaviorVersion, Region, StalledStreamProtectionConfig};
 use aws_sdk_s3::primitives::ByteStream;
+use aws_sdk_s3::types::CompletedMultipartUpload;
+use aws_sdk_s3::types::CompletedPart;
 use tempfile::TempDir;
 
 use local_s3::server::{AppState, build_router};
@@ -577,4 +579,581 @@ async fn test_list_objects_v1_with_delimiter() {
         .filter_map(|cp| cp.prefix())
         .collect();
     assert_eq!(prefixes, vec!["dir/"]);
+}
+
+// --- Multipart Upload tests ---
+
+#[tokio::test]
+async fn test_multipart_upload_complete() {
+    let s = TestServer::start().await;
+    s.create_bucket("test-bucket").await;
+
+    // Create multipart upload
+    let create_result = s
+        .client
+        .create_multipart_upload()
+        .bucket("test-bucket")
+        .key("multipart.bin")
+        .send()
+        .await
+        .unwrap();
+
+    let upload_id = create_result.upload_id().unwrap().to_string();
+    assert!(!upload_id.is_empty());
+
+    // Upload part 1
+    let part1_data = b"hello ";
+    let part1_result = s
+        .client
+        .upload_part()
+        .bucket("test-bucket")
+        .key("multipart.bin")
+        .upload_id(&upload_id)
+        .part_number(1)
+        .body(ByteStream::from(part1_data.to_vec()))
+        .send()
+        .await
+        .unwrap();
+    let etag1 = part1_result.e_tag().unwrap().to_string();
+
+    // Upload part 2
+    let part2_data = b"world";
+    let part2_result = s
+        .client
+        .upload_part()
+        .bucket("test-bucket")
+        .key("multipart.bin")
+        .upload_id(&upload_id)
+        .part_number(2)
+        .body(ByteStream::from(part2_data.to_vec()))
+        .send()
+        .await
+        .unwrap();
+    let etag2 = part2_result.e_tag().unwrap().to_string();
+
+    // Complete multipart upload
+    let completed = CompletedMultipartUpload::builder()
+        .parts(
+            CompletedPart::builder()
+                .part_number(1)
+                .e_tag(&etag1)
+                .build(),
+        )
+        .parts(
+            CompletedPart::builder()
+                .part_number(2)
+                .e_tag(&etag2)
+                .build(),
+        )
+        .build();
+
+    let complete_result = s
+        .client
+        .complete_multipart_upload()
+        .bucket("test-bucket")
+        .key("multipart.bin")
+        .upload_id(&upload_id)
+        .multipart_upload(completed)
+        .send()
+        .await
+        .unwrap();
+
+    // Verify the ETag has composite format (hex-N)
+    let etag = complete_result.e_tag().unwrap();
+    assert!(
+        etag.contains('-'),
+        "Composite ETag should contain dash: {etag}"
+    );
+
+    // Verify the assembled content
+    let get_result = s
+        .client
+        .get_object()
+        .bucket("test-bucket")
+        .key("multipart.bin")
+        .send()
+        .await
+        .unwrap();
+
+    let body = get_result.body.collect().await.unwrap().into_bytes();
+    assert_eq!(body.as_ref(), b"hello world");
+}
+
+#[tokio::test]
+async fn test_multipart_upload_abort() {
+    let s = TestServer::start().await;
+    s.create_bucket("test-bucket").await;
+
+    // Create multipart upload
+    let create_result = s
+        .client
+        .create_multipart_upload()
+        .bucket("test-bucket")
+        .key("abort-me.bin")
+        .send()
+        .await
+        .unwrap();
+
+    let upload_id = create_result.upload_id().unwrap().to_string();
+
+    // Upload a part
+    s.client
+        .upload_part()
+        .bucket("test-bucket")
+        .key("abort-me.bin")
+        .upload_id(&upload_id)
+        .part_number(1)
+        .body(ByteStream::from(b"data".to_vec()))
+        .send()
+        .await
+        .unwrap();
+
+    // Abort the upload
+    s.client
+        .abort_multipart_upload()
+        .bucket("test-bucket")
+        .key("abort-me.bin")
+        .upload_id(&upload_id)
+        .send()
+        .await
+        .unwrap();
+
+    // Verify the object was not created
+    let result = s
+        .client
+        .get_object()
+        .bucket("test-bucket")
+        .key("abort-me.bin")
+        .send()
+        .await;
+    assert!(result.is_err(), "Object should not exist after abort");
+}
+
+#[tokio::test]
+async fn test_multipart_upload_list_parts() {
+    let s = TestServer::start().await;
+    s.create_bucket("test-bucket").await;
+
+    let create_result = s
+        .client
+        .create_multipart_upload()
+        .bucket("test-bucket")
+        .key("parts-test.bin")
+        .send()
+        .await
+        .unwrap();
+
+    let upload_id = create_result.upload_id().unwrap().to_string();
+
+    // Upload 3 parts
+    for i in 1..=3 {
+        s.client
+            .upload_part()
+            .bucket("test-bucket")
+            .key("parts-test.bin")
+            .upload_id(&upload_id)
+            .part_number(i)
+            .body(ByteStream::from(format!("part{i}").into_bytes()))
+            .send()
+            .await
+            .unwrap();
+    }
+
+    // List parts
+    let list_result = s
+        .client
+        .list_parts()
+        .bucket("test-bucket")
+        .key("parts-test.bin")
+        .upload_id(&upload_id)
+        .send()
+        .await
+        .unwrap();
+
+    let parts = list_result.parts();
+    assert_eq!(parts.len(), 3);
+    assert_eq!(parts[0].part_number(), Some(1));
+    assert_eq!(parts[1].part_number(), Some(2));
+    assert_eq!(parts[2].part_number(), Some(3));
+
+    // Clean up
+    s.client
+        .abort_multipart_upload()
+        .bucket("test-bucket")
+        .key("parts-test.bin")
+        .upload_id(&upload_id)
+        .send()
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn test_multipart_upload_list_uploads() {
+    let s = TestServer::start().await;
+    s.create_bucket("test-bucket").await;
+
+    // Create two multipart uploads
+    let create1 = s
+        .client
+        .create_multipart_upload()
+        .bucket("test-bucket")
+        .key("file1.bin")
+        .send()
+        .await
+        .unwrap();
+    let id1 = create1.upload_id().unwrap().to_string();
+
+    let create2 = s
+        .client
+        .create_multipart_upload()
+        .bucket("test-bucket")
+        .key("file2.bin")
+        .send()
+        .await
+        .unwrap();
+    let id2 = create2.upload_id().unwrap().to_string();
+
+    // List multipart uploads
+    let list_result = s
+        .client
+        .list_multipart_uploads()
+        .bucket("test-bucket")
+        .send()
+        .await
+        .unwrap();
+
+    let uploads = list_result.uploads();
+    assert_eq!(uploads.len(), 2);
+
+    let upload_ids: Vec<&str> = uploads.iter().filter_map(|u| u.upload_id()).collect();
+    assert!(upload_ids.contains(&id1.as_str()));
+    assert!(upload_ids.contains(&id2.as_str()));
+
+    // Clean up
+    s.client
+        .abort_multipart_upload()
+        .bucket("test-bucket")
+        .key("file1.bin")
+        .upload_id(&id1)
+        .send()
+        .await
+        .unwrap();
+    s.client
+        .abort_multipart_upload()
+        .bucket("test-bucket")
+        .key("file2.bin")
+        .upload_id(&id2)
+        .send()
+        .await
+        .unwrap();
+}
+
+// --- Range request tests ---
+
+#[tokio::test]
+async fn test_range_request() {
+    let s = TestServer::start().await;
+    s.create_bucket("test-bucket").await;
+
+    let content = b"abcdefghijklmnopqrstuvwxyz";
+    s.put_object("test-bucket", "alphabet.txt", content).await;
+
+    // GET with range bytes=0-4 -> "abcde"
+    let result = s
+        .client
+        .get_object()
+        .bucket("test-bucket")
+        .key("alphabet.txt")
+        .range("bytes=0-4")
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(result.content_length(), Some(5));
+    let body = result.body.collect().await.unwrap().into_bytes();
+    assert_eq!(body.as_ref(), b"abcde");
+}
+
+#[tokio::test]
+async fn test_range_request_suffix() {
+    let s = TestServer::start().await;
+    s.create_bucket("test-bucket").await;
+
+    let content = b"abcdefghijklmnopqrstuvwxyz";
+    s.put_object("test-bucket", "alphabet.txt", content).await;
+
+    // GET with range bytes=-5 -> last 5 bytes -> "vwxyz"
+    let result = s
+        .client
+        .get_object()
+        .bucket("test-bucket")
+        .key("alphabet.txt")
+        .range("bytes=-5")
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(result.content_length(), Some(5));
+    let body = result.body.collect().await.unwrap().into_bytes();
+    assert_eq!(body.as_ref(), b"vwxyz");
+}
+
+// --- Conditional request tests ---
+
+#[tokio::test]
+async fn test_if_none_match_304() {
+    let s = TestServer::start().await;
+    s.create_bucket("test-bucket").await;
+
+    let put_result = s
+        .client
+        .put_object()
+        .bucket("test-bucket")
+        .key("cond.txt")
+        .body(ByteStream::from(b"conditional data".to_vec()))
+        .send()
+        .await
+        .unwrap();
+
+    let etag = put_result.e_tag().unwrap().to_string();
+
+    // GET with If-None-Match set to the object's ETag should result in 304.
+    // The SDK surfaces a 304 as an error because there is no response body.
+    let result = s
+        .client
+        .get_object()
+        .bucket("test-bucket")
+        .key("cond.txt")
+        .if_none_match(&etag)
+        .send()
+        .await;
+
+    assert!(
+        result.is_err(),
+        "Expected 304 Not Modified to be surfaced as an error by the SDK"
+    );
+}
+
+#[tokio::test]
+async fn test_if_none_match_different_etag() {
+    let s = TestServer::start().await;
+    s.create_bucket("test-bucket").await;
+
+    s.put_object("test-bucket", "cond2.txt", b"some data").await;
+
+    // GET with a non-matching ETag should succeed normally
+    let result = s
+        .client
+        .get_object()
+        .bucket("test-bucket")
+        .key("cond2.txt")
+        .if_none_match("\"not-the-real-etag\"")
+        .send()
+        .await
+        .unwrap();
+
+    let body = result.body.collect().await.unwrap().into_bytes();
+    assert_eq!(body.as_ref(), b"some data");
+}
+
+// --- Object Tagging tests ---
+
+#[tokio::test]
+async fn test_put_and_get_object_tagging() {
+    let s = TestServer::start().await;
+    s.create_bucket("test-bucket").await;
+    s.put_object("test-bucket", "tagged.txt", b"tagged content")
+        .await;
+
+    let tagging = aws_sdk_s3::types::Tagging::builder()
+        .tag_set(
+            aws_sdk_s3::types::Tag::builder()
+                .key("env")
+                .value("production")
+                .build()
+                .unwrap(),
+        )
+        .tag_set(
+            aws_sdk_s3::types::Tag::builder()
+                .key("team")
+                .value("backend")
+                .build()
+                .unwrap(),
+        )
+        .build()
+        .unwrap();
+
+    s.client
+        .put_object_tagging()
+        .bucket("test-bucket")
+        .key("tagged.txt")
+        .tagging(tagging)
+        .send()
+        .await
+        .unwrap();
+
+    let get_result = s
+        .client
+        .get_object_tagging()
+        .bucket("test-bucket")
+        .key("tagged.txt")
+        .send()
+        .await
+        .unwrap();
+
+    let tags = get_result.tag_set();
+    assert_eq!(tags.len(), 2);
+
+    let mut tag_map: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
+    for tag in tags {
+        tag_map.insert(tag.key(), tag.value());
+    }
+    assert_eq!(tag_map.get("env"), Some(&"production"));
+    assert_eq!(tag_map.get("team"), Some(&"backend"));
+}
+
+#[tokio::test]
+async fn test_delete_object_tagging() {
+    let s = TestServer::start().await;
+    s.create_bucket("test-bucket").await;
+    s.put_object("test-bucket", "tagged-del.txt", b"content")
+        .await;
+
+    // Put some tags
+    let tagging = aws_sdk_s3::types::Tagging::builder()
+        .tag_set(
+            aws_sdk_s3::types::Tag::builder()
+                .key("color")
+                .value("blue")
+                .build()
+                .unwrap(),
+        )
+        .build()
+        .unwrap();
+
+    s.client
+        .put_object_tagging()
+        .bucket("test-bucket")
+        .key("tagged-del.txt")
+        .tagging(tagging)
+        .send()
+        .await
+        .unwrap();
+
+    // Delete the tags
+    s.client
+        .delete_object_tagging()
+        .bucket("test-bucket")
+        .key("tagged-del.txt")
+        .send()
+        .await
+        .unwrap();
+
+    // Verify tags are gone
+    let get_result = s
+        .client
+        .get_object_tagging()
+        .bucket("test-bucket")
+        .key("tagged-del.txt")
+        .send()
+        .await
+        .unwrap();
+
+    assert!(
+        get_result.tag_set().is_empty(),
+        "Tag set should be empty after delete"
+    );
+}
+
+// --- CORS Configuration tests ---
+
+#[tokio::test]
+async fn test_put_and_get_bucket_cors() {
+    let s = TestServer::start().await;
+    s.create_bucket("cors-bucket").await;
+
+    let cors_rule = aws_sdk_s3::types::CorsRule::builder()
+        .allowed_origins("*")
+        .allowed_methods("GET")
+        .allowed_methods("PUT")
+        .allowed_headers("*")
+        .build()
+        .unwrap();
+
+    let cors_config = aws_sdk_s3::types::CorsConfiguration::builder()
+        .cors_rules(cors_rule)
+        .build()
+        .unwrap();
+
+    s.client
+        .put_bucket_cors()
+        .bucket("cors-bucket")
+        .cors_configuration(cors_config)
+        .send()
+        .await
+        .unwrap();
+
+    let get_result = s
+        .client
+        .get_bucket_cors()
+        .bucket("cors-bucket")
+        .send()
+        .await
+        .unwrap();
+
+    let rules = get_result.cors_rules();
+    assert_eq!(rules.len(), 1);
+    assert_eq!(rules[0].allowed_origins(), &["*".to_string()]);
+    assert_eq!(
+        rules[0].allowed_methods(),
+        &["GET".to_string(), "PUT".to_string()]
+    );
+    assert_eq!(rules[0].allowed_headers(), &["*".to_string()]);
+}
+
+#[tokio::test]
+async fn test_delete_bucket_cors() {
+    let s = TestServer::start().await;
+    s.create_bucket("cors-del-bucket").await;
+
+    // Put CORS config
+    let cors_rule = aws_sdk_s3::types::CorsRule::builder()
+        .allowed_origins("http://example.com")
+        .allowed_methods("GET")
+        .build()
+        .unwrap();
+
+    let cors_config = aws_sdk_s3::types::CorsConfiguration::builder()
+        .cors_rules(cors_rule)
+        .build()
+        .unwrap();
+
+    s.client
+        .put_bucket_cors()
+        .bucket("cors-del-bucket")
+        .cors_configuration(cors_config)
+        .send()
+        .await
+        .unwrap();
+
+    // Delete CORS config
+    s.client
+        .delete_bucket_cors()
+        .bucket("cors-del-bucket")
+        .send()
+        .await
+        .unwrap();
+
+    // GET CORS should fail (no config)
+    let result = s
+        .client
+        .get_bucket_cors()
+        .bucket("cors-del-bucket")
+        .send()
+        .await;
+
+    assert!(
+        result.is_err(),
+        "Getting CORS after delete should fail with no configuration"
+    );
 }

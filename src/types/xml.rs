@@ -184,6 +184,158 @@ pub struct CopyObjectResult {
     pub last_modified: String,
 }
 
+// --- Multipart Upload ---
+
+// CreateMultipartUpload response
+#[derive(Debug, Serialize)]
+#[serde(rename = "InitiateMultipartUploadResult")]
+pub struct InitiateMultipartUploadResult {
+    #[serde(rename = "@xmlns")]
+    pub xmlns: String,
+    #[serde(rename = "Bucket")]
+    pub bucket: String,
+    #[serde(rename = "Key")]
+    pub key: String,
+    #[serde(rename = "UploadId")]
+    pub upload_id: String,
+}
+
+// CompleteMultipartUpload request body
+#[derive(Debug, Deserialize)]
+#[serde(rename = "CompleteMultipartUpload")]
+pub struct CompleteMultipartUploadRequest {
+    #[serde(rename = "Part")]
+    pub parts: Vec<CompletePart>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CompletePart {
+    #[serde(rename = "PartNumber")]
+    pub part_number: i32,
+    #[serde(rename = "ETag")]
+    pub etag: String,
+}
+
+// CompleteMultipartUpload response
+#[derive(Debug, Serialize)]
+#[serde(rename = "CompleteMultipartUploadResult")]
+pub struct CompleteMultipartUploadResult {
+    #[serde(rename = "@xmlns")]
+    pub xmlns: String,
+    #[serde(rename = "Location")]
+    pub location: String,
+    #[serde(rename = "Bucket")]
+    pub bucket: String,
+    #[serde(rename = "Key")]
+    pub key: String,
+    #[serde(rename = "ETag")]
+    pub etag: String,
+}
+
+// ListParts response
+#[derive(Debug, Serialize)]
+#[serde(rename = "ListPartsResult")]
+pub struct ListPartsResult {
+    #[serde(rename = "@xmlns")]
+    pub xmlns: String,
+    #[serde(rename = "Bucket")]
+    pub bucket: String,
+    #[serde(rename = "Key")]
+    pub key: String,
+    #[serde(rename = "UploadId")]
+    pub upload_id: String,
+    #[serde(rename = "MaxParts")]
+    pub max_parts: i32,
+    #[serde(rename = "IsTruncated")]
+    pub is_truncated: bool,
+    #[serde(rename = "Part", default)]
+    pub parts: Vec<PartEntry>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PartEntry {
+    #[serde(rename = "PartNumber")]
+    pub part_number: i32,
+    #[serde(rename = "LastModified")]
+    pub last_modified: String,
+    #[serde(rename = "ETag")]
+    pub etag: String,
+    #[serde(rename = "Size")]
+    pub size: u64,
+}
+
+// ListMultipartUploads response
+#[derive(Debug, Serialize)]
+#[serde(rename = "ListMultipartUploadsResult")]
+pub struct ListMultipartUploadsResult {
+    #[serde(rename = "@xmlns")]
+    pub xmlns: String,
+    #[serde(rename = "Bucket")]
+    pub bucket: String,
+    #[serde(rename = "MaxUploads")]
+    pub max_uploads: i32,
+    #[serde(rename = "IsTruncated")]
+    pub is_truncated: bool,
+    #[serde(rename = "Upload", default)]
+    pub uploads: Vec<UploadEntry>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct UploadEntry {
+    #[serde(rename = "Key")]
+    pub key: String,
+    #[serde(rename = "UploadId")]
+    pub upload_id: String,
+    #[serde(rename = "Initiated")]
+    pub initiated: String,
+}
+
+// --- Object Tagging ---
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename = "Tagging")]
+pub struct Tagging {
+    #[serde(rename = "TagSet")]
+    pub tag_set: TagSet,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct TagSet {
+    #[serde(rename = "Tag", default)]
+    pub tags: Vec<Tag>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Tag {
+    #[serde(rename = "Key")]
+    pub key: String,
+    #[serde(rename = "Value")]
+    pub value: String,
+}
+
+// --- CORS Configuration ---
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename = "CORSConfiguration")]
+pub struct CORSConfiguration {
+    #[serde(rename = "CORSRule")]
+    pub rules: Vec<CORSRuleXml>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CORSRuleXml {
+    #[serde(rename = "AllowedOrigin")]
+    pub allowed_origin: Vec<String>,
+    #[serde(rename = "AllowedMethod")]
+    pub allowed_method: Vec<String>,
+    #[serde(rename = "AllowedHeader", default)]
+    pub allowed_header: Vec<String>,
+    #[serde(rename = "MaxAgeSeconds", skip_serializing_if = "Option::is_none")]
+    pub max_age_seconds: Option<i32>,
+    #[serde(rename = "ExposeHeader", default)]
+    pub expose_header: Vec<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

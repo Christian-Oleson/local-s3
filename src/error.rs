@@ -25,6 +25,18 @@ pub enum S3Error {
     #[error("The specified bucket is not valid")]
     InvalidBucketName { bucket_name: String },
 
+    #[error("The specified upload does not exist")]
+    NoSuchUpload { upload_id: String },
+
+    #[error("Invalid part: {message}")]
+    InvalidPart { message: String },
+
+    #[error("The requested range is not satisfiable")]
+    InvalidRange { key: String },
+
+    #[error("The CORS configuration does not exist")]
+    NoSuchCORSConfiguration { bucket_name: String },
+
     #[error("Internal server error: {message}")]
     InternalError { message: String },
 }
@@ -38,6 +50,10 @@ impl S3Error {
             S3Error::BucketAlreadyExists { .. } => "BucketAlreadyExists",
             S3Error::BucketNotEmpty { .. } => "BucketNotEmpty",
             S3Error::InvalidBucketName { .. } => "InvalidBucketName",
+            S3Error::NoSuchUpload { .. } => "NoSuchUpload",
+            S3Error::InvalidPart { .. } => "InvalidPart",
+            S3Error::InvalidRange { .. } => "InvalidRange",
+            S3Error::NoSuchCORSConfiguration { .. } => "NoSuchCORSConfiguration",
             S3Error::InternalError { .. } => "InternalError",
         }
     }
@@ -50,6 +66,10 @@ impl S3Error {
             S3Error::BucketAlreadyExists { .. } => StatusCode::CONFLICT,
             S3Error::BucketNotEmpty { .. } => StatusCode::CONFLICT,
             S3Error::InvalidBucketName { .. } => StatusCode::BAD_REQUEST,
+            S3Error::NoSuchUpload { .. } => StatusCode::NOT_FOUND,
+            S3Error::InvalidPart { .. } => StatusCode::BAD_REQUEST,
+            S3Error::InvalidRange { .. } => StatusCode::RANGE_NOT_SATISFIABLE,
+            S3Error::NoSuchCORSConfiguration { .. } => StatusCode::NOT_FOUND,
             S3Error::InternalError { .. } => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -62,6 +82,10 @@ impl S3Error {
             S3Error::BucketAlreadyExists { bucket_name } => format!("/{bucket_name}"),
             S3Error::BucketNotEmpty { bucket_name } => format!("/{bucket_name}"),
             S3Error::InvalidBucketName { bucket_name } => format!("/{bucket_name}"),
+            S3Error::NoSuchUpload { upload_id } => format!("/{upload_id}"),
+            S3Error::InvalidPart { .. } => "/".to_string(),
+            S3Error::InvalidRange { key } => format!("/{key}"),
+            S3Error::NoSuchCORSConfiguration { bucket_name } => format!("/{bucket_name}"),
             S3Error::InternalError { .. } => "/".to_string(),
         }
     }
