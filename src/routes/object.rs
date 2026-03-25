@@ -55,6 +55,9 @@ pub struct ObjectQuery {
     pub part_number: Option<i32>,
     pub uploads: Option<String>,
     pub tagging: Option<String>,
+    #[serde(rename = "versionId")]
+    pub version_id: Option<String>,
+    pub acl: Option<String>,
 }
 
 pub async fn put_object_handler(
@@ -69,6 +72,11 @@ pub async fn put_object_handler(
     // If tagging query param is present, this is PutObjectTagging
     if query.tagging.is_some() {
         return handle_put_object_tagging(&state, &bucket_name, key, &body).await;
+    }
+
+    // If acl query param is present, this is PutObjectAcl
+    if query.acl.is_some() {
+        return handle_put_object_acl(&state, &bucket_name, key, &body).await;
     }
 
     // If partNumber AND uploadId are present, this is an UploadPart request
@@ -112,7 +120,14 @@ pub async fn put_object_handler(
         )
         .await?;
 
-    Ok((StatusCode::OK, [("etag", metadata.etag.as_str())], "").into_response())
+    let mut response = (StatusCode::OK, [("etag", metadata.etag.as_str())], "").into_response();
+    if let Some(ref vid) = metadata.version_id {
+        response.headers_mut().insert(
+            "x-amz-version-id",
+            HeaderValue::from_str(vid).unwrap_or_else(|_| HeaderValue::from_static("")),
+        );
+    }
+    Ok(response)
 }
 
 /// Format a DateTime<Utc> as RFC 7231: "Thu, 01 Jan 2024 00:00:00 GMT"
@@ -182,6 +197,11 @@ pub async fn get_object_handler(
         return handle_get_object_tagging(&state, &bucket_name, key).await;
     }
 
+    // If acl query param is present, this is GetObjectAcl
+    if query.acl.is_some() {
+        return handle_get_object_acl(&state, &bucket_name, key).await;
+    }
+
     // If uploadId is present, this is a ListParts request
     if let Some(ref upload_id) = query.upload_id {
         let upload_state = state.storage.list_parts(&bucket_name, upload_id).await?;
@@ -215,7 +235,10 @@ pub async fn get_object_handler(
         return Ok(xml_response(xml));
     }
 
-    let (metadata, body) = state.storage.get_object(&bucket_name, key).await?;
+    let (metadata, body) = state
+        .storage
+        .get_object(&bucket_name, key, query.version_id.as_deref())
+        .await?;
 
     // Check conditional request headers
     if let Some(resp) = check_conditionals(&headers, &metadata) {
@@ -238,6 +261,12 @@ pub async fn get_object_handler(
     for (k, v) in header_map.iter() {
         resp_headers.insert(k, v.clone());
     }
+    if let Some(ref vid) = metadata.version_id {
+        resp_headers.insert(
+            "x-amz-version-id",
+            HeaderValue::from_str(vid).unwrap_or_else(|_| HeaderValue::from_static("")),
+        );
+    }
 
     Ok(response)
 }
@@ -245,11 +274,15 @@ pub async fn get_object_handler(
 pub async fn head_object_handler(
     State(state): State<AppState>,
     Path((bucket_name, key)): Path<(String, String)>,
+    Query(query): Query<ObjectQuery>,
     headers: HeaderMap,
 ) -> Result<Response, S3Error> {
     let key = normalize_key(&key);
 
-    let metadata = state.storage.head_object(&bucket_name, key).await?;
+    let metadata = state
+        .storage
+        .head_object(&bucket_name, key, query.version_id.as_deref())
+        .await?;
 
     // Check conditional request headers
     if let Some(resp) = check_conditionals(&headers, &metadata) {
@@ -264,6 +297,12 @@ pub async fn head_object_handler(
     resp_headers.insert("accept-ranges", HeaderValue::from_static("bytes"));
     for (k, v) in header_map.iter() {
         resp_headers.insert(k, v.clone());
+    }
+    if let Some(ref vid) = metadata.version_id {
+        resp_headers.insert(
+            "x-amz-version-id",
+            HeaderValue::from_str(vid).unwrap_or_else(|_| HeaderValue::from_static("")),
+        );
     }
 
     Ok(response)
@@ -294,9 +333,25 @@ pub async fn delete_object_handler(
         return Ok(StatusCode::NO_CONTENT.into_response());
     }
 
-    state.storage.delete_object(&bucket_name, key).await?;
+    let result = state
+        .storage
+        .delete_object(&bucket_name, key, query.version_id.as_deref())
+        .await?;
 
-    Ok(StatusCode::NO_CONTENT.into_response())
+    let mut response = StatusCode::NO_CONTENT.into_response();
+    if let Some(ref vid) = result.version_id {
+        response.headers_mut().insert(
+            "x-amz-version-id",
+            HeaderValue::from_str(vid).unwrap_or_else(|_| HeaderValue::from_static("")),
+        );
+    }
+    if result.is_delete_marker {
+        response
+            .headers_mut()
+            .insert("x-amz-delete-marker", HeaderValue::from_static("true"));
+    }
+
+    Ok(response)
 }
 
 /// POST handler for object-level operations (multipart upload).
@@ -628,6 +683,33 @@ fn percent_decode(input: &str) -> String {
         }
     }
     result
+}
+
+// --- Object ACL handlers ---
+
+async fn handle_put_object_acl(
+    state: &AppState,
+    bucket: &str,
+    key: &str,
+    body: &[u8],
+) -> Result<Response, S3Error> {
+    let acl_xml = std::str::from_utf8(body).map_err(|e| S3Error::InternalError {
+        message: format!("Invalid UTF-8 in ACL body: {e}"),
+    })?;
+
+    state.storage.put_object_acl(bucket, key, acl_xml).await?;
+
+    Ok((StatusCode::OK, [("content-length", "0")], "").into_response())
+}
+
+async fn handle_get_object_acl(
+    state: &AppState,
+    bucket: &str,
+    key: &str,
+) -> Result<Response, S3Error> {
+    let acl = state.storage.get_object_acl(bucket, key).await?;
+
+    Ok((StatusCode::OK, [("content-type", "application/xml")], acl).into_response())
 }
 
 #[cfg(test)]

@@ -37,6 +37,15 @@ pub enum S3Error {
     #[error("The CORS configuration does not exist")]
     NoSuchCORSConfiguration { bucket_name: String },
 
+    #[error("The bucket policy does not exist")]
+    NoSuchBucketPolicy { bucket_name: String },
+
+    #[error("The lifecycle configuration does not exist")]
+    NoSuchLifecycleConfiguration { bucket_name: String },
+
+    #[error("{message}")]
+    MethodNotAllowed { message: String },
+
     #[error("Internal server error: {message}")]
     InternalError { message: String },
 }
@@ -54,6 +63,9 @@ impl S3Error {
             S3Error::InvalidPart { .. } => "InvalidPart",
             S3Error::InvalidRange { .. } => "InvalidRange",
             S3Error::NoSuchCORSConfiguration { .. } => "NoSuchCORSConfiguration",
+            S3Error::NoSuchBucketPolicy { .. } => "NoSuchBucketPolicy",
+            S3Error::NoSuchLifecycleConfiguration { .. } => "NoSuchLifecycleConfiguration",
+            S3Error::MethodNotAllowed { .. } => "MethodNotAllowed",
             S3Error::InternalError { .. } => "InternalError",
         }
     }
@@ -70,6 +82,9 @@ impl S3Error {
             S3Error::InvalidPart { .. } => StatusCode::BAD_REQUEST,
             S3Error::InvalidRange { .. } => StatusCode::RANGE_NOT_SATISFIABLE,
             S3Error::NoSuchCORSConfiguration { .. } => StatusCode::NOT_FOUND,
+            S3Error::NoSuchBucketPolicy { .. } => StatusCode::NOT_FOUND,
+            S3Error::NoSuchLifecycleConfiguration { .. } => StatusCode::NOT_FOUND,
+            S3Error::MethodNotAllowed { .. } => StatusCode::METHOD_NOT_ALLOWED,
             S3Error::InternalError { .. } => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -86,6 +101,9 @@ impl S3Error {
             S3Error::InvalidPart { .. } => "/".to_string(),
             S3Error::InvalidRange { key } => format!("/{key}"),
             S3Error::NoSuchCORSConfiguration { bucket_name } => format!("/{bucket_name}"),
+            S3Error::NoSuchBucketPolicy { bucket_name } => format!("/{bucket_name}"),
+            S3Error::NoSuchLifecycleConfiguration { bucket_name } => format!("/{bucket_name}"),
+            S3Error::MethodNotAllowed { .. } => "/".to_string(),
             S3Error::InternalError { .. } => "/".to_string(),
         }
     }

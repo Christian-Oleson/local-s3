@@ -45,6 +45,13 @@ pub struct PartInfo {
     pub last_modified: DateTime<Utc>,
 }
 
+/// Result of a delete_object call, used to convey versioning information.
+#[derive(Debug)]
+pub struct DeleteObjectResult {
+    pub version_id: Option<String>,
+    pub is_delete_marker: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CorsRule {
     pub allowed_origins: Vec<String>,
@@ -231,6 +238,457 @@ impl FileSystemStorage {
             || name == ".uploads"
             || name == ".tags"
             || name == ".cors.json"
+            || name == ".versioning.json"
+            || name == ".versions"
+            || name == ".policy.json"
+            || name == ".acl.xml"
+            || name == ".acls"
+            || name == ".lifecycle.xml"
+    }
+
+    // --- Versioning Configuration ---
+
+    fn versioning_path(&self, bucket: &str) -> PathBuf {
+        self.bucket_path(bucket).join(".versioning.json")
+    }
+
+    fn versions_dir(&self, bucket: &str) -> PathBuf {
+        self.bucket_path(bucket).join(".versions")
+    }
+
+    fn version_data_path(&self, bucket: &str, key: &str, version_id: &str) -> PathBuf {
+        self.versions_dir(bucket)
+            .join(key)
+            .join(format!("{version_id}.data"))
+    }
+
+    fn version_meta_path(&self, bucket: &str, key: &str, version_id: &str) -> PathBuf {
+        self.versions_dir(bucket)
+            .join(key)
+            .join(format!("{version_id}.meta.json"))
+    }
+
+    pub async fn put_bucket_versioning(&self, bucket: &str, status: &str) -> Result<(), S3Error> {
+        if !self.bucket_exists(bucket) {
+            return Err(S3Error::NoSuchBucket {
+                bucket_name: bucket.to_string(),
+            });
+        }
+
+        let config = serde_json::json!({ "status": status });
+        let json = serde_json::to_string_pretty(&config).map_err(|e| S3Error::InternalError {
+            message: format!("Failed to serialize versioning config: {e}"),
+        })?;
+
+        fs::write(self.versioning_path(bucket), json)
+            .await
+            .map_err(|e| S3Error::InternalError {
+                message: format!("Failed to write versioning config: {e}"),
+            })?;
+
+        Ok(())
+    }
+
+    pub async fn get_bucket_versioning(&self, bucket: &str) -> Result<Option<String>, S3Error> {
+        if !self.bucket_exists(bucket) {
+            return Err(S3Error::NoSuchBucket {
+                bucket_name: bucket.to_string(),
+            });
+        }
+
+        let path = self.versioning_path(bucket);
+        if !path.is_file() {
+            return Ok(None);
+        }
+
+        let content = fs::read_to_string(&path)
+            .await
+            .map_err(|e| S3Error::InternalError {
+                message: format!("Failed to read versioning config: {e}"),
+            })?;
+
+        let config: serde_json::Value =
+            serde_json::from_str(&content).map_err(|e| S3Error::InternalError {
+                message: format!("Failed to parse versioning config: {e}"),
+            })?;
+
+        Ok(config
+            .get("status")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()))
+    }
+
+    pub async fn is_versioning_enabled(&self, bucket: &str) -> bool {
+        matches!(
+            self.get_bucket_versioning(bucket).await,
+            Ok(Some(ref s)) if s == "Enabled"
+        )
+    }
+
+    /// Save a version (data + metadata) to the .versions/ directory.
+    async fn save_version(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: &str,
+        data: &[u8],
+        metadata: &ObjectMetadata,
+    ) -> Result<(), S3Error> {
+        let data_path = self.version_data_path(bucket, key, version_id);
+        let meta_path = self.version_meta_path(bucket, key, version_id);
+
+        if let Some(parent) = data_path.parent() {
+            fs::create_dir_all(parent)
+                .await
+                .map_err(|e| S3Error::InternalError {
+                    message: format!("Failed to create versions directory: {e}"),
+                })?;
+        }
+
+        fs::write(&data_path, data)
+            .await
+            .map_err(|e| S3Error::InternalError {
+                message: format!("Failed to write version data: {e}"),
+            })?;
+
+        let metadata_json =
+            serde_json::to_string_pretty(metadata).map_err(|e| S3Error::InternalError {
+                message: format!("Failed to serialize version metadata: {e}"),
+            })?;
+
+        fs::write(&meta_path, metadata_json)
+            .await
+            .map_err(|e| S3Error::InternalError {
+                message: format!("Failed to write version metadata: {e}"),
+            })?;
+
+        Ok(())
+    }
+
+    /// Read a specific version from .versions/.
+    async fn read_version(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: &str,
+    ) -> Result<(ObjectMetadata, Vec<u8>), S3Error> {
+        let data_path = self.version_data_path(bucket, key, version_id);
+        let meta_path = self.version_meta_path(bucket, key, version_id);
+
+        if !meta_path.is_file() {
+            return Err(S3Error::NoSuchKey {
+                key: key.to_string(),
+            });
+        }
+
+        let content = fs::read_to_string(&meta_path)
+            .await
+            .map_err(|e| S3Error::InternalError {
+                message: format!("Failed to read version metadata: {e}"),
+            })?;
+
+        let metadata: ObjectMetadata =
+            serde_json::from_str(&content).map_err(|e| S3Error::InternalError {
+                message: format!("Failed to parse version metadata: {e}"),
+            })?;
+
+        // Delete markers have no data file
+        if metadata.is_delete_marker {
+            return Ok((metadata, Vec::new()));
+        }
+
+        let data = fs::read(&data_path)
+            .await
+            .map_err(|e| S3Error::InternalError {
+                message: format!("Failed to read version data: {e}"),
+            })?;
+
+        Ok((metadata, data))
+    }
+
+    /// Read version metadata only (no body data).
+    async fn read_version_metadata(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: &str,
+    ) -> Result<ObjectMetadata, S3Error> {
+        let meta_path = self.version_meta_path(bucket, key, version_id);
+
+        if !meta_path.is_file() {
+            return Err(S3Error::NoSuchKey {
+                key: key.to_string(),
+            });
+        }
+
+        let content = fs::read_to_string(&meta_path)
+            .await
+            .map_err(|e| S3Error::InternalError {
+                message: format!("Failed to read version metadata: {e}"),
+            })?;
+
+        serde_json::from_str(&content).map_err(|e| S3Error::InternalError {
+            message: format!("Failed to parse version metadata: {e}"),
+        })
+    }
+
+    /// Delete a specific version from .versions/.
+    async fn delete_version(&self, bucket: &str, key: &str, version_id: &str) {
+        let data_path = self.version_data_path(bucket, key, version_id);
+        let meta_path = self.version_meta_path(bucket, key, version_id);
+
+        if data_path.is_file() {
+            let _ = fs::remove_file(&data_path).await;
+        }
+        if meta_path.is_file() {
+            let _ = fs::remove_file(&meta_path).await;
+        }
+
+        // Clean up empty parent directories within .versions
+        let versions_dir = self.versions_dir(bucket);
+        self.cleanup_empty_parents(&meta_path, &versions_dir).await;
+    }
+
+    /// List all version IDs for a given key, sorted by last_modified descending.
+    async fn list_versions_for_key(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> Result<Vec<ObjectMetadata>, S3Error> {
+        let key_versions_dir = self.versions_dir(bucket).join(key);
+        if !key_versions_dir.is_dir() {
+            return Ok(Vec::new());
+        }
+
+        let mut versions = Vec::new();
+        let mut entries =
+            fs::read_dir(&key_versions_dir)
+                .await
+                .map_err(|e| S3Error::InternalError {
+                    message: format!("Failed to read versions directory: {e}"),
+                })?;
+
+        while let Some(entry) = entries
+            .next_entry()
+            .await
+            .map_err(|e| S3Error::InternalError {
+                message: format!("Failed to read version entry: {e}"),
+            })?
+        {
+            let path = entry.path();
+            let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if file_name.ends_with(".meta.json")
+                && let Ok(content) = fs::read_to_string(&path).await
+                && let Ok(meta) = serde_json::from_str::<ObjectMetadata>(&content)
+            {
+                versions.push(meta);
+            }
+        }
+
+        // Sort by last_modified descending (newest first)
+        versions.sort_by(|a, b| b.last_modified.cmp(&a.last_modified));
+        Ok(versions)
+    }
+
+    /// Restore the most recent non-delete-marker version as the current object,
+    /// or remove the current object if no such version exists.
+    async fn restore_latest_version(&self, bucket: &str, key: &str) -> Result<(), S3Error> {
+        let versions = self.list_versions_for_key(bucket, key).await?;
+
+        // Find the most recent non-delete-marker
+        let latest = versions.iter().find(|v| !v.is_delete_marker);
+
+        match latest {
+            Some(meta) => {
+                let vid = meta.version_id.as_deref().unwrap_or("null");
+                let data_path = self.version_data_path(bucket, key, vid);
+                let data = if data_path.is_file() {
+                    fs::read(&data_path).await.unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
+
+                // Write to current location
+                let obj_path = self.object_path(bucket, key);
+                if let Some(parent) = obj_path.parent() {
+                    let _ = fs::create_dir_all(parent).await;
+                }
+                let _ = fs::write(&obj_path, &data).await;
+
+                // Write metadata to current location
+                let meta_path = self.object_metadata_path(bucket, key);
+                if let Some(parent) = meta_path.parent() {
+                    let _ = fs::create_dir_all(parent).await;
+                }
+                let metadata_json = serde_json::to_string_pretty(meta).unwrap_or_default();
+                let _ = fs::write(&meta_path, metadata_json).await;
+
+                Ok(())
+            }
+            None => {
+                // No non-delete-marker versions remain; remove current object
+                let obj_path = self.object_path(bucket, key);
+                if obj_path.is_file() {
+                    let _ = fs::remove_file(&obj_path).await;
+                }
+                let meta_path = self.object_metadata_path(bucket, key);
+                if meta_path.is_file() {
+                    let _ = fs::remove_file(&meta_path).await;
+                }
+                let bucket_path = self.bucket_path(bucket);
+                self.cleanup_empty_parents(&obj_path, &bucket_path).await;
+                self.cleanup_empty_parents(&meta_path, &bucket_path).await;
+                Ok(())
+            }
+        }
+    }
+
+    /// List all object versions across all keys in a bucket.
+    pub async fn list_object_versions(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        max_keys: i32,
+    ) -> Result<crate::types::xml::ListVersionsResult, S3Error> {
+        use crate::types::xml::{
+            DeleteMarkerEntry, ListVersionsResult, S3_NAMESPACE, VersionEntry,
+        };
+
+        if !self.bucket_exists(bucket) {
+            return Err(S3Error::NoSuchBucket {
+                bucket_name: bucket.to_string(),
+            });
+        }
+
+        // Collect all versions from .versions/ directory
+        let versions_dir = self.versions_dir(bucket);
+        let mut all_versions: Vec<ObjectMetadata> = Vec::new();
+
+        if versions_dir.is_dir() {
+            self.walk_versions_dir(&versions_dir, &versions_dir, &mut all_versions)
+                .await?;
+        }
+
+        // Also include the current version of each object (from .meta/)
+        let meta_dir = self.bucket_path(bucket).join(".meta");
+        if meta_dir.is_dir() {
+            let mut current_objects: Vec<ObjectInfo> = Vec::new();
+            self.walk_meta_dir(&meta_dir, &meta_dir, &mut current_objects)
+                .await?;
+
+            for obj in current_objects {
+                // Read the full metadata for this current object
+                if let Ok(meta) = self.read_object_metadata(bucket, &obj.key).await {
+                    // Only include if it has a version_id (versioned)
+                    if meta.version_id.is_some() {
+                        // Check if this version is already in all_versions
+                        let already_present = all_versions
+                            .iter()
+                            .any(|v| v.key == meta.key && v.version_id == meta.version_id);
+                        if !already_present {
+                            all_versions.push(meta);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Filter by prefix
+        all_versions.retain(|v| v.key.starts_with(prefix));
+
+        // Sort by key ASC, then last_modified DESC
+        all_versions.sort_by(|a, b| {
+            a.key
+                .cmp(&b.key)
+                .then_with(|| b.last_modified.cmp(&a.last_modified))
+        });
+
+        // Determine is_latest per key
+        let mut latest_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        let mut versions = Vec::new();
+        let mut delete_markers = Vec::new();
+        let max = max_keys as usize;
+        let mut is_truncated = false;
+
+        for (count, meta) in all_versions.iter().enumerate() {
+            if count >= max {
+                is_truncated = true;
+                break;
+            }
+
+            let is_latest = latest_keys.insert(meta.key.clone());
+            let vid = meta
+                .version_id
+                .clone()
+                .unwrap_or_else(|| "null".to_string());
+            let last_modified = meta
+                .last_modified
+                .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+                .to_string();
+
+            if meta.is_delete_marker {
+                delete_markers.push(DeleteMarkerEntry {
+                    key: meta.key.clone(),
+                    version_id: vid,
+                    is_latest,
+                    last_modified,
+                });
+            } else {
+                versions.push(VersionEntry {
+                    key: meta.key.clone(),
+                    version_id: vid,
+                    is_latest,
+                    last_modified,
+                    etag: meta.etag.clone(),
+                    size: meta.content_length,
+                });
+            }
+        }
+
+        Ok(ListVersionsResult {
+            xmlns: S3_NAMESPACE.to_string(),
+            name: bucket.to_string(),
+            prefix: prefix.to_string(),
+            max_keys,
+            is_truncated,
+            versions,
+            delete_markers,
+        })
+    }
+
+    /// Walk the .versions/ directory tree to collect all version metadata.
+    async fn walk_versions_dir(
+        &self,
+        dir: &std::path::Path,
+        versions_root: &std::path::Path,
+        versions: &mut Vec<ObjectMetadata>,
+    ) -> Result<(), S3Error> {
+        let mut entries = fs::read_dir(dir)
+            .await
+            .map_err(|e| S3Error::InternalError {
+                message: format!("Failed to read versions directory: {e}"),
+            })?;
+
+        while let Some(entry) = entries
+            .next_entry()
+            .await
+            .map_err(|e| S3Error::InternalError {
+                message: format!("Failed to read versions directory entry: {e}"),
+            })?
+        {
+            let path = entry.path();
+            if path.is_dir() {
+                Box::pin(self.walk_versions_dir(&path, versions_root, versions)).await?;
+            } else if let Some(file_name) = path.file_name().and_then(|n| n.to_str())
+                && file_name.ends_with(".meta.json")
+                && let Ok(content) = fs::read_to_string(&path).await
+                && let Ok(meta) = serde_json::from_str::<ObjectMetadata>(&content)
+            {
+                versions.push(meta);
+            }
+        }
+        Ok(())
     }
 
     // --- Object CRUD ---
@@ -254,11 +712,37 @@ impl FileSystemStorage {
             });
         }
 
+        let versioning_enabled = self.is_versioning_enabled(bucket).await;
+        let versioning_status = self.get_bucket_versioning(bucket).await.unwrap_or(None);
+        let is_suspended = versioning_status.as_deref() == Some("Suspended");
+
+        // If versioning is enabled, archive the current version before overwriting
+        if versioning_enabled
+            && let Ok(current_meta) = self.read_object_metadata(bucket, key).await
+            && let Some(ref vid) = current_meta.version_id
+        {
+            let current_obj_path = self.object_path(bucket, key);
+            if current_obj_path.is_file() {
+                let current_body = fs::read(&current_obj_path).await.unwrap_or_default();
+                self.save_version(bucket, key, vid, &current_body, &current_meta)
+                    .await?;
+            }
+        }
+
         // Compute ETag (quoted hex MD5)
         let mut hasher = Md5::new();
         hasher.update(body);
         let digest = hasher.finalize();
         let etag = format!("\"{}\"", hex::encode(digest));
+
+        // Determine version_id for the new object
+        let version_id = if versioning_enabled {
+            Some(Uuid::new_v4().to_string())
+        } else if is_suspended {
+            Some("null".to_string())
+        } else {
+            None
+        };
 
         let obj_path = self.object_path(bucket, key);
 
@@ -289,6 +773,8 @@ impl FileSystemStorage {
             cache_control,
             content_encoding,
             expires,
+            version_id: version_id.clone(),
+            is_delete_marker: false,
         };
 
         // Write metadata sidecar
@@ -312,6 +798,11 @@ impl FileSystemStorage {
                 message: format!("Failed to write object metadata: {e}"),
             })?;
 
+        // Also save new version to .versions/ when versioning is enabled
+        if versioning_enabled && let Some(ref vid) = version_id {
+            self.save_version(bucket, key, vid, body, &metadata).await?;
+        }
+
         Ok(metadata)
     }
 
@@ -319,11 +810,25 @@ impl FileSystemStorage {
         &self,
         bucket: &str,
         key: &str,
+        version_id: Option<&str>,
     ) -> Result<(ObjectMetadata, Vec<u8>), S3Error> {
         if !self.bucket_exists(bucket) {
             return Err(S3Error::NoSuchBucket {
                 bucket_name: bucket.to_string(),
             });
+        }
+
+        // If a specific version is requested, read from .versions/
+        if let Some(vid) = version_id {
+            let (metadata, body) = self.read_version(bucket, key, vid).await?;
+            if metadata.is_delete_marker {
+                // S3 returns 405 MethodNotAllowed when you GET a delete marker by version
+                return Err(S3Error::MethodNotAllowed {
+                    message: "The specified method is not allowed against this resource"
+                        .to_string(),
+                });
+            }
+            return Ok((metadata, body));
         }
 
         let obj_path = self.object_path(bucket, key);
@@ -334,6 +839,14 @@ impl FileSystemStorage {
         }
 
         let metadata = self.read_object_metadata(bucket, key).await?;
+
+        // If the current version is a delete marker, return NoSuchKey
+        if metadata.is_delete_marker {
+            return Err(S3Error::NoSuchKey {
+                key: key.to_string(),
+            });
+        }
+
         let body = fs::read(&obj_path)
             .await
             .map_err(|e| S3Error::InternalError {
@@ -343,11 +856,28 @@ impl FileSystemStorage {
         Ok((metadata, body))
     }
 
-    pub async fn head_object(&self, bucket: &str, key: &str) -> Result<ObjectMetadata, S3Error> {
+    pub async fn head_object(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: Option<&str>,
+    ) -> Result<ObjectMetadata, S3Error> {
         if !self.bucket_exists(bucket) {
             return Err(S3Error::NoSuchBucket {
                 bucket_name: bucket.to_string(),
             });
+        }
+
+        // If a specific version is requested, read from .versions/
+        if let Some(vid) = version_id {
+            let metadata = self.read_version_metadata(bucket, key, vid).await?;
+            if metadata.is_delete_marker {
+                return Err(S3Error::MethodNotAllowed {
+                    message: "The specified method is not allowed against this resource"
+                        .to_string(),
+                });
+            }
+            return Ok(metadata);
         }
 
         let obj_path = self.object_path(bucket, key);
@@ -357,16 +887,125 @@ impl FileSystemStorage {
             });
         }
 
-        self.read_object_metadata(bucket, key).await
+        let metadata = self.read_object_metadata(bucket, key).await?;
+
+        if metadata.is_delete_marker {
+            return Err(S3Error::NoSuchKey {
+                key: key.to_string(),
+            });
+        }
+
+        Ok(metadata)
     }
 
-    pub async fn delete_object(&self, bucket: &str, key: &str) -> Result<(), S3Error> {
+    pub async fn delete_object(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: Option<&str>,
+    ) -> Result<DeleteObjectResult, S3Error> {
         if !self.bucket_exists(bucket) {
             return Err(S3Error::NoSuchBucket {
                 bucket_name: bucket.to_string(),
             });
         }
 
+        // If a specific version ID is provided, permanently delete that version
+        if let Some(vid) = version_id {
+            // Check if this version exists
+            let meta_path = self.version_meta_path(bucket, key, vid);
+            let was_delete_marker = if meta_path.is_file() {
+                let content = fs::read_to_string(&meta_path).await.unwrap_or_default();
+                serde_json::from_str::<ObjectMetadata>(&content)
+                    .map(|m| m.is_delete_marker)
+                    .unwrap_or(false)
+            } else {
+                false
+            };
+
+            self.delete_version(bucket, key, vid).await;
+
+            // Check if the deleted version was the current one
+            let current_meta = self.read_object_metadata(bucket, key).await.ok();
+            let was_current =
+                current_meta.as_ref().and_then(|m| m.version_id.as_deref()) == Some(vid);
+
+            if was_current {
+                // Restore the latest remaining version as current
+                self.restore_latest_version(bucket, key).await?;
+            }
+
+            return Ok(DeleteObjectResult {
+                version_id: Some(vid.to_string()),
+                is_delete_marker: was_delete_marker,
+            });
+        }
+
+        // Check if versioning is enabled
+        let versioning_enabled = self.is_versioning_enabled(bucket).await;
+
+        if versioning_enabled {
+            // Archive the current version if it exists
+            if let Ok(current_meta) = self.read_object_metadata(bucket, key).await
+                && let Some(ref vid) = current_meta.version_id
+            {
+                let current_obj_path = self.object_path(bucket, key);
+                if current_obj_path.is_file() {
+                    let current_body = fs::read(&current_obj_path).await.unwrap_or_default();
+                    self.save_version(bucket, key, vid, &current_body, &current_meta)
+                        .await?;
+                }
+            }
+
+            // Create a delete marker
+            let delete_marker_version_id = Uuid::new_v4().to_string();
+            let delete_marker_meta = ObjectMetadata {
+                key: key.to_string(),
+                content_type: String::new(),
+                content_length: 0,
+                etag: String::new(),
+                last_modified: Utc::now(),
+                custom_metadata: HashMap::new(),
+                content_disposition: None,
+                cache_control: None,
+                content_encoding: None,
+                expires: None,
+                version_id: Some(delete_marker_version_id.clone()),
+                is_delete_marker: true,
+            };
+
+            // Save the delete marker as a version
+            self.save_version(
+                bucket,
+                key,
+                &delete_marker_version_id,
+                &[],
+                &delete_marker_meta,
+            )
+            .await?;
+
+            // Update the current metadata to be the delete marker
+            let meta_path = self.object_metadata_path(bucket, key);
+            if let Some(parent) = meta_path.parent() {
+                let _ = fs::create_dir_all(parent).await;
+            }
+            let metadata_json =
+                serde_json::to_string_pretty(&delete_marker_meta).unwrap_or_default();
+            let _ = fs::write(&meta_path, metadata_json).await;
+
+            // Remove the current object data file
+            let obj_path = self.object_path(bucket, key);
+            if obj_path.is_file() {
+                let _ = fs::remove_file(&obj_path).await;
+            }
+
+            return Ok(DeleteObjectResult {
+                version_id: Some(delete_marker_version_id),
+                is_delete_marker: true,
+            });
+        }
+
+        // Non-versioned: simple delete (existing behavior)
         // S3 delete is idempotent: no error for missing keys
         let obj_path = self.object_path(bucket, key);
         if obj_path.is_file() {
@@ -391,7 +1030,10 @@ impl FileSystemStorage {
         self.cleanup_empty_parents(&meta_path, &bucket_path).await;
         self.cleanup_empty_parents(&tags_path, &bucket_path).await;
 
-        Ok(())
+        Ok(DeleteObjectResult {
+            version_id: None,
+            is_delete_marker: false,
+        })
     }
 
     // --- List / Copy / Batch-delete ---
@@ -559,7 +1201,7 @@ impl FileSystemStorage {
         dst_key: &str,
     ) -> Result<ObjectMetadata, S3Error> {
         // Read source
-        let (src_meta, body) = self.get_object(src_bucket, src_key).await?;
+        let (src_meta, body) = self.get_object(src_bucket, src_key, None).await?;
 
         // Write to destination using put_object logic
         let metadata = self
@@ -593,7 +1235,7 @@ impl FileSystemStorage {
         let mut deleted = Vec::new();
         for key in keys {
             // delete_object is idempotent, so we always report it as deleted
-            self.delete_object(bucket, key).await?;
+            self.delete_object(bucket, key, None).await?;
             deleted.push(key.clone());
         }
 
@@ -773,6 +1415,254 @@ impl FileSystemStorage {
         let cors_path = self.cors_path(bucket);
         if cors_path.is_file() {
             let _ = fs::remove_file(&cors_path).await;
+        }
+
+        Ok(())
+    }
+
+    // --- Bucket Policy ---
+
+    fn policy_path(&self, bucket: &str) -> PathBuf {
+        self.bucket_path(bucket).join(".policy.json")
+    }
+
+    pub async fn put_bucket_policy(&self, bucket: &str, policy_json: &str) -> Result<(), S3Error> {
+        if !self.bucket_exists(bucket) {
+            return Err(S3Error::NoSuchBucket {
+                bucket_name: bucket.to_string(),
+            });
+        }
+
+        fs::write(self.policy_path(bucket), policy_json)
+            .await
+            .map_err(|e| S3Error::InternalError {
+                message: format!("Failed to write bucket policy: {e}"),
+            })?;
+
+        Ok(())
+    }
+
+    pub async fn get_bucket_policy(&self, bucket: &str) -> Result<String, S3Error> {
+        if !self.bucket_exists(bucket) {
+            return Err(S3Error::NoSuchBucket {
+                bucket_name: bucket.to_string(),
+            });
+        }
+
+        let path = self.policy_path(bucket);
+        if !path.is_file() {
+            return Err(S3Error::NoSuchBucketPolicy {
+                bucket_name: bucket.to_string(),
+            });
+        }
+
+        fs::read_to_string(&path)
+            .await
+            .map_err(|e| S3Error::InternalError {
+                message: format!("Failed to read bucket policy: {e}"),
+            })
+    }
+
+    pub async fn delete_bucket_policy(&self, bucket: &str) -> Result<(), S3Error> {
+        if !self.bucket_exists(bucket) {
+            return Err(S3Error::NoSuchBucket {
+                bucket_name: bucket.to_string(),
+            });
+        }
+
+        let path = self.policy_path(bucket);
+        if path.is_file() {
+            let _ = fs::remove_file(&path).await;
+        }
+
+        Ok(())
+    }
+
+    // --- Bucket ACL ---
+
+    fn bucket_acl_path(&self, bucket: &str) -> PathBuf {
+        self.bucket_path(bucket).join(".acl.xml")
+    }
+
+    fn default_acl_xml() -> String {
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<AccessControlPolicy xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Owner><ID>local-s3-owner-id</ID><DisplayName>local-s3</DisplayName></Owner>
+  <AccessControlList>
+    <Grant>
+      <Grantee xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:type="CanonicalUser">
+        <ID>local-s3-owner-id</ID><DisplayName>local-s3</DisplayName>
+      </Grantee>
+      <Permission>FULL_CONTROL</Permission>
+    </Grant>
+  </AccessControlList>
+</AccessControlPolicy>"#
+            .to_string()
+    }
+
+    pub async fn put_bucket_acl(&self, bucket: &str, acl_xml: &str) -> Result<(), S3Error> {
+        if !self.bucket_exists(bucket) {
+            return Err(S3Error::NoSuchBucket {
+                bucket_name: bucket.to_string(),
+            });
+        }
+
+        fs::write(self.bucket_acl_path(bucket), acl_xml)
+            .await
+            .map_err(|e| S3Error::InternalError {
+                message: format!("Failed to write bucket ACL: {e}"),
+            })?;
+
+        Ok(())
+    }
+
+    pub async fn get_bucket_acl(&self, bucket: &str) -> Result<String, S3Error> {
+        if !self.bucket_exists(bucket) {
+            return Err(S3Error::NoSuchBucket {
+                bucket_name: bucket.to_string(),
+            });
+        }
+
+        let path = self.bucket_acl_path(bucket);
+        if !path.is_file() {
+            return Ok(Self::default_acl_xml());
+        }
+
+        fs::read_to_string(&path)
+            .await
+            .map_err(|e| S3Error::InternalError {
+                message: format!("Failed to read bucket ACL: {e}"),
+            })
+    }
+
+    // --- Object ACL ---
+
+    fn object_acl_path(&self, bucket: &str, key: &str) -> PathBuf {
+        self.bucket_path(bucket)
+            .join(".acls")
+            .join(format!("{key}.xml"))
+    }
+
+    pub async fn put_object_acl(
+        &self,
+        bucket: &str,
+        key: &str,
+        acl_xml: &str,
+    ) -> Result<(), S3Error> {
+        if !self.bucket_exists(bucket) {
+            return Err(S3Error::NoSuchBucket {
+                bucket_name: bucket.to_string(),
+            });
+        }
+
+        let obj_path = self.object_path(bucket, key);
+        if !obj_path.is_file() {
+            return Err(S3Error::NoSuchKey {
+                key: key.to_string(),
+            });
+        }
+
+        let acl_path = self.object_acl_path(bucket, key);
+        if let Some(parent) = acl_path.parent() {
+            fs::create_dir_all(parent)
+                .await
+                .map_err(|e| S3Error::InternalError {
+                    message: format!("Failed to create ACLs directory: {e}"),
+                })?;
+        }
+
+        fs::write(&acl_path, acl_xml)
+            .await
+            .map_err(|e| S3Error::InternalError {
+                message: format!("Failed to write object ACL: {e}"),
+            })?;
+
+        Ok(())
+    }
+
+    pub async fn get_object_acl(&self, bucket: &str, key: &str) -> Result<String, S3Error> {
+        if !self.bucket_exists(bucket) {
+            return Err(S3Error::NoSuchBucket {
+                bucket_name: bucket.to_string(),
+            });
+        }
+
+        let obj_path = self.object_path(bucket, key);
+        if !obj_path.is_file() {
+            return Err(S3Error::NoSuchKey {
+                key: key.to_string(),
+            });
+        }
+
+        let acl_path = self.object_acl_path(bucket, key);
+        if !acl_path.is_file() {
+            return Ok(Self::default_acl_xml());
+        }
+
+        fs::read_to_string(&acl_path)
+            .await
+            .map_err(|e| S3Error::InternalError {
+                message: format!("Failed to read object ACL: {e}"),
+            })
+    }
+
+    // --- Lifecycle Configuration ---
+
+    fn lifecycle_path(&self, bucket: &str) -> PathBuf {
+        self.bucket_path(bucket).join(".lifecycle.xml")
+    }
+
+    pub async fn put_bucket_lifecycle(
+        &self,
+        bucket: &str,
+        lifecycle_xml: &str,
+    ) -> Result<(), S3Error> {
+        if !self.bucket_exists(bucket) {
+            return Err(S3Error::NoSuchBucket {
+                bucket_name: bucket.to_string(),
+            });
+        }
+
+        fs::write(self.lifecycle_path(bucket), lifecycle_xml)
+            .await
+            .map_err(|e| S3Error::InternalError {
+                message: format!("Failed to write lifecycle configuration: {e}"),
+            })?;
+
+        Ok(())
+    }
+
+    pub async fn get_bucket_lifecycle(&self, bucket: &str) -> Result<String, S3Error> {
+        if !self.bucket_exists(bucket) {
+            return Err(S3Error::NoSuchBucket {
+                bucket_name: bucket.to_string(),
+            });
+        }
+
+        let path = self.lifecycle_path(bucket);
+        if !path.is_file() {
+            return Err(S3Error::NoSuchLifecycleConfiguration {
+                bucket_name: bucket.to_string(),
+            });
+        }
+
+        fs::read_to_string(&path)
+            .await
+            .map_err(|e| S3Error::InternalError {
+                message: format!("Failed to read lifecycle configuration: {e}"),
+            })
+    }
+
+    pub async fn delete_bucket_lifecycle(&self, bucket: &str) -> Result<(), S3Error> {
+        if !self.bucket_exists(bucket) {
+            return Err(S3Error::NoSuchBucket {
+                bucket_name: bucket.to_string(),
+            });
+        }
+
+        let path = self.lifecycle_path(bucket);
+        if path.is_file() {
+            let _ = fs::remove_file(&path).await;
         }
 
         Ok(())
@@ -1017,6 +1907,8 @@ impl FileSystemStorage {
             cache_control: None,
             content_encoding: None,
             expires: None,
+            version_id: None,
+            is_delete_marker: false,
         };
 
         // Write metadata sidecar
@@ -1376,7 +2268,7 @@ mod tests {
         assert_eq!(meta.etag, "\"5eb63bbbe01eeed093cb22bb8f5acdc3\"");
 
         let (got_meta, got_body) = storage
-            .get_object("test-bucket", "greeting.txt")
+            .get_object("test-bucket", "greeting.txt", None)
             .await
             .unwrap();
         assert_eq!(got_body, b"hello world");
@@ -1410,7 +2302,7 @@ mod tests {
         let (storage, _tmp) = test_storage().await;
 
         let err = storage
-            .get_object("no-bucket", "key.txt")
+            .get_object("no-bucket", "key.txt", None)
             .await
             .unwrap_err();
         assert!(matches!(err, S3Error::NoSuchBucket { .. }));
@@ -1422,7 +2314,7 @@ mod tests {
         create_test_bucket(&storage).await;
 
         let err = storage
-            .get_object("test-bucket", "missing.txt")
+            .get_object("test-bucket", "missing.txt", None)
             .await
             .unwrap_err();
         assert!(matches!(err, S3Error::NoSuchKey { .. }));
@@ -1449,7 +2341,7 @@ mod tests {
             .unwrap();
 
         let meta = storage
-            .head_object("test-bucket", "info.txt")
+            .head_object("test-bucket", "info.txt", None)
             .await
             .unwrap();
         assert_eq!(meta.key, "info.txt");
@@ -1462,7 +2354,7 @@ mod tests {
         create_test_bucket(&storage).await;
 
         let err = storage
-            .head_object("test-bucket", "missing.txt")
+            .head_object("test-bucket", "missing.txt", None)
             .await
             .unwrap_err();
         assert!(matches!(err, S3Error::NoSuchKey { .. }));
@@ -1490,13 +2382,13 @@ mod tests {
 
         // Delete should succeed
         storage
-            .delete_object("test-bucket", "doomed.txt")
+            .delete_object("test-bucket", "doomed.txt", None)
             .await
             .unwrap();
 
         // Get should now fail with NoSuchKey
         let err = storage
-            .get_object("test-bucket", "doomed.txt")
+            .get_object("test-bucket", "doomed.txt", None)
             .await
             .unwrap_err();
         assert!(matches!(err, S3Error::NoSuchKey { .. }));
@@ -1509,7 +2401,7 @@ mod tests {
 
         // Deleting a non-existent key should succeed (S3 is idempotent)
         storage
-            .delete_object("test-bucket", "nonexistent.txt")
+            .delete_object("test-bucket", "nonexistent.txt", None)
             .await
             .unwrap();
     }
@@ -1519,7 +2411,7 @@ mod tests {
         let (storage, _tmp) = test_storage().await;
 
         let err = storage
-            .delete_object("no-bucket", "key.txt")
+            .delete_object("no-bucket", "key.txt", None)
             .await
             .unwrap_err();
         assert!(matches!(err, S3Error::NoSuchBucket { .. }));
@@ -1548,7 +2440,7 @@ mod tests {
         assert_eq!(meta.key, "path/to/deep/file.txt");
 
         let (_, body) = storage
-            .get_object("test-bucket", "path/to/deep/file.txt")
+            .get_object("test-bucket", "path/to/deep/file.txt", None)
             .await
             .unwrap();
         assert_eq!(body, b"nested content");
@@ -1575,7 +2467,7 @@ mod tests {
             .unwrap();
 
         storage
-            .delete_object("test-bucket", "a/b/c/file.txt")
+            .delete_object("test-bucket", "a/b/c/file.txt", None)
             .await
             .unwrap();
 
@@ -1621,7 +2513,7 @@ mod tests {
 
         // Verify round-trip through head_object
         let head = storage
-            .head_object("test-bucket", "meta.txt")
+            .head_object("test-bucket", "meta.txt", None)
             .await
             .unwrap();
         assert_eq!(head.custom_metadata.get("author").unwrap(), "test-user");
@@ -1666,7 +2558,10 @@ mod tests {
             .await
             .unwrap();
 
-        let (meta, body) = storage.get_object("test-bucket", "file.txt").await.unwrap();
+        let (meta, body) = storage
+            .get_object("test-bucket", "file.txt", None)
+            .await
+            .unwrap();
         assert_eq!(body, b"version 2");
         assert_eq!(meta.content_length, 9);
     }
@@ -1696,7 +2591,7 @@ mod tests {
         assert_eq!(meta.etag, "\"d41d8cd98f00b204e9800998ecf8427e\"");
 
         let (_, body) = storage
-            .get_object("test-bucket", "empty.txt")
+            .get_object("test-bucket", "empty.txt", None)
             .await
             .unwrap();
         assert!(body.is_empty());
@@ -1723,7 +2618,7 @@ mod tests {
             .await
             .unwrap();
         storage
-            .delete_object("test-bucket", "temp.txt")
+            .delete_object("test-bucket", "temp.txt", None)
             .await
             .unwrap();
 
@@ -1936,10 +2831,13 @@ mod tests {
 
         // Both should exist
         let (_, body1) = storage
-            .get_object("test-bucket", "original.txt")
+            .get_object("test-bucket", "original.txt", None)
             .await
             .unwrap();
-        let (_, body2) = storage.get_object("test-bucket", "copy.txt").await.unwrap();
+        let (_, body2) = storage
+            .get_object("test-bucket", "copy.txt", None)
+            .await
+            .unwrap();
         assert_eq!(body1, body2);
     }
 
@@ -1962,7 +2860,7 @@ mod tests {
         assert_eq!(meta.key, "dest.txt");
 
         let (_, body) = storage
-            .get_object("other-bucket", "dest.txt")
+            .get_object("other-bucket", "dest.txt", None)
             .await
             .unwrap();
         assert_eq!(body, b"content of source.txt");
@@ -2165,7 +3063,7 @@ mod tests {
 
         // Verify assembled content
         let (_, body) = storage
-            .get_object("test-bucket", "assembled.bin")
+            .get_object("test-bucket", "assembled.bin", None)
             .await
             .unwrap();
         assert_eq!(body, b"hello world");
@@ -2594,7 +3492,7 @@ mod tests {
 
         // Delete the object
         storage
-            .delete_object("test-bucket", "tagged.txt")
+            .delete_object("test-bucket", "tagged.txt", None)
             .await
             .unwrap();
 
@@ -2777,5 +3675,1293 @@ mod tests {
         assert_eq!(got.len(), 2);
         assert_eq!(got[0].allowed_origins, vec!["http://app.example.com"]);
         assert_eq!(got[1].allowed_methods.len(), 3);
+    }
+
+    // --- Versioning tests ---
+
+    #[tokio::test]
+    async fn test_is_internal_entry_versioning() {
+        assert!(FileSystemStorage::is_internal_entry(".versioning.json"));
+        assert!(FileSystemStorage::is_internal_entry(".versions"));
+    }
+
+    #[tokio::test]
+    async fn test_versioning_config_default_none() {
+        let (storage, _tmp) = test_storage().await;
+        create_test_bucket(&storage).await;
+
+        let status = storage.get_bucket_versioning("test-bucket").await.unwrap();
+        assert!(status.is_none());
+        assert!(!storage.is_versioning_enabled("test-bucket").await);
+    }
+
+    #[tokio::test]
+    async fn test_versioning_config_enable() {
+        let (storage, _tmp) = test_storage().await;
+        create_test_bucket(&storage).await;
+
+        storage
+            .put_bucket_versioning("test-bucket", "Enabled")
+            .await
+            .unwrap();
+
+        let status = storage.get_bucket_versioning("test-bucket").await.unwrap();
+        assert_eq!(status, Some("Enabled".to_string()));
+        assert!(storage.is_versioning_enabled("test-bucket").await);
+    }
+
+    #[tokio::test]
+    async fn test_versioning_config_suspend() {
+        let (storage, _tmp) = test_storage().await;
+        create_test_bucket(&storage).await;
+
+        storage
+            .put_bucket_versioning("test-bucket", "Enabled")
+            .await
+            .unwrap();
+        storage
+            .put_bucket_versioning("test-bucket", "Suspended")
+            .await
+            .unwrap();
+
+        let status = storage.get_bucket_versioning("test-bucket").await.unwrap();
+        assert_eq!(status, Some("Suspended".to_string()));
+        assert!(!storage.is_versioning_enabled("test-bucket").await);
+    }
+
+    #[tokio::test]
+    async fn test_versioning_config_no_bucket() {
+        let (storage, _tmp) = test_storage().await;
+
+        let err = storage
+            .put_bucket_versioning("no-bucket", "Enabled")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, S3Error::NoSuchBucket { .. }));
+
+        let err = storage
+            .get_bucket_versioning("no-bucket")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, S3Error::NoSuchBucket { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_versioned_put_creates_version_id() {
+        let (storage, _tmp) = test_storage().await;
+        create_test_bucket(&storage).await;
+        storage
+            .put_bucket_versioning("test-bucket", "Enabled")
+            .await
+            .unwrap();
+
+        let meta = storage
+            .put_object(
+                "test-bucket",
+                "versioned.txt",
+                b"v1 content",
+                "text/plain",
+                HashMap::new(),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert!(meta.version_id.is_some());
+        assert!(!meta.is_delete_marker);
+    }
+
+    #[tokio::test]
+    async fn test_unversioned_put_no_version_id() {
+        let (storage, _tmp) = test_storage().await;
+        create_test_bucket(&storage).await;
+
+        let meta = storage
+            .put_object(
+                "test-bucket",
+                "unversioned.txt",
+                b"content",
+                "text/plain",
+                HashMap::new(),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert!(meta.version_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_versioned_put_multiple_versions() {
+        let (storage, _tmp) = test_storage().await;
+        create_test_bucket(&storage).await;
+        storage
+            .put_bucket_versioning("test-bucket", "Enabled")
+            .await
+            .unwrap();
+
+        let meta1 = storage
+            .put_object(
+                "test-bucket",
+                "file.txt",
+                b"version 1",
+                "text/plain",
+                HashMap::new(),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let meta2 = storage
+            .put_object(
+                "test-bucket",
+                "file.txt",
+                b"version 2",
+                "text/plain",
+                HashMap::new(),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Version IDs should be different
+        assert_ne!(meta1.version_id, meta2.version_id);
+
+        // GET without version_id returns the latest version
+        let (got_meta, got_body) = storage
+            .get_object("test-bucket", "file.txt", None)
+            .await
+            .unwrap();
+        assert_eq!(got_body, b"version 2");
+        assert_eq!(got_meta.version_id, meta2.version_id);
+
+        // GET with version_id returns specific version
+        let vid1 = meta1.version_id.as_deref().unwrap();
+        let (got_meta_v1, got_body_v1) = storage
+            .get_object("test-bucket", "file.txt", Some(vid1))
+            .await
+            .unwrap();
+        assert_eq!(got_body_v1, b"version 1");
+        assert_eq!(got_meta_v1.version_id.as_deref(), Some(vid1));
+    }
+
+    #[tokio::test]
+    async fn test_versioned_get_by_version_id() {
+        let (storage, _tmp) = test_storage().await;
+        create_test_bucket(&storage).await;
+        storage
+            .put_bucket_versioning("test-bucket", "Enabled")
+            .await
+            .unwrap();
+
+        let meta1 = storage
+            .put_object(
+                "test-bucket",
+                "file.txt",
+                b"first",
+                "text/plain",
+                HashMap::new(),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let _meta2 = storage
+            .put_object(
+                "test-bucket",
+                "file.txt",
+                b"second",
+                "text/plain",
+                HashMap::new(),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let vid1 = meta1.version_id.as_deref().unwrap();
+        let (_, body) = storage
+            .get_object("test-bucket", "file.txt", Some(vid1))
+            .await
+            .unwrap();
+        assert_eq!(body, b"first");
+    }
+
+    #[tokio::test]
+    async fn test_versioned_head_by_version_id() {
+        let (storage, _tmp) = test_storage().await;
+        create_test_bucket(&storage).await;
+        storage
+            .put_bucket_versioning("test-bucket", "Enabled")
+            .await
+            .unwrap();
+
+        let meta1 = storage
+            .put_object(
+                "test-bucket",
+                "file.txt",
+                b"first",
+                "text/plain",
+                HashMap::new(),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let _meta2 = storage
+            .put_object(
+                "test-bucket",
+                "file.txt",
+                b"second version",
+                "text/plain",
+                HashMap::new(),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let vid1 = meta1.version_id.as_deref().unwrap();
+        let head = storage
+            .head_object("test-bucket", "file.txt", Some(vid1))
+            .await
+            .unwrap();
+        assert_eq!(head.content_length, 5); // "first" = 5 bytes
+        assert_eq!(head.version_id.as_deref(), Some(vid1));
+    }
+
+    #[tokio::test]
+    async fn test_versioned_delete_creates_marker() {
+        let (storage, _tmp) = test_storage().await;
+        create_test_bucket(&storage).await;
+        storage
+            .put_bucket_versioning("test-bucket", "Enabled")
+            .await
+            .unwrap();
+
+        let meta = storage
+            .put_object(
+                "test-bucket",
+                "to-delete.txt",
+                b"content",
+                "text/plain",
+                HashMap::new(),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let result = storage
+            .delete_object("test-bucket", "to-delete.txt", None)
+            .await
+            .unwrap();
+
+        assert!(result.is_delete_marker);
+        assert!(result.version_id.is_some());
+
+        // GET without version_id should return NoSuchKey (delete marker)
+        let err = storage
+            .get_object("test-bucket", "to-delete.txt", None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, S3Error::NoSuchKey { .. }));
+
+        // But the original version is still accessible by version_id
+        let vid = meta.version_id.as_deref().unwrap();
+        let (_, body) = storage
+            .get_object("test-bucket", "to-delete.txt", Some(vid))
+            .await
+            .unwrap();
+        assert_eq!(body, b"content");
+    }
+
+    #[tokio::test]
+    async fn test_versioned_delete_specific_version() {
+        let (storage, _tmp) = test_storage().await;
+        create_test_bucket(&storage).await;
+        storage
+            .put_bucket_versioning("test-bucket", "Enabled")
+            .await
+            .unwrap();
+
+        let meta1 = storage
+            .put_object(
+                "test-bucket",
+                "file.txt",
+                b"v1",
+                "text/plain",
+                HashMap::new(),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let meta2 = storage
+            .put_object(
+                "test-bucket",
+                "file.txt",
+                b"v2",
+                "text/plain",
+                HashMap::new(),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Delete the old version specifically
+        let vid1 = meta1.version_id.as_deref().unwrap();
+        let result = storage
+            .delete_object("test-bucket", "file.txt", Some(vid1))
+            .await
+            .unwrap();
+        assert!(!result.is_delete_marker);
+        assert_eq!(result.version_id.as_deref(), Some(vid1));
+
+        // Old version should be gone
+        let err = storage
+            .get_object("test-bucket", "file.txt", Some(vid1))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, S3Error::NoSuchKey { .. }));
+
+        // Latest version should still be accessible
+        let vid2 = meta2.version_id.as_deref().unwrap();
+        let (_, body) = storage
+            .get_object("test-bucket", "file.txt", Some(vid2))
+            .await
+            .unwrap();
+        assert_eq!(body, b"v2");
+    }
+
+    #[tokio::test]
+    async fn test_versioned_delete_marker_then_delete_marker() {
+        let (storage, _tmp) = test_storage().await;
+        create_test_bucket(&storage).await;
+        storage
+            .put_bucket_versioning("test-bucket", "Enabled")
+            .await
+            .unwrap();
+
+        let meta = storage
+            .put_object(
+                "test-bucket",
+                "file.txt",
+                b"data",
+                "text/plain",
+                HashMap::new(),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Create a delete marker
+        let del_result = storage
+            .delete_object("test-bucket", "file.txt", None)
+            .await
+            .unwrap();
+        assert!(del_result.is_delete_marker);
+
+        // Now delete the delete marker by version ID
+        let dm_vid = del_result.version_id.as_deref().unwrap();
+        let result2 = storage
+            .delete_object("test-bucket", "file.txt", Some(dm_vid))
+            .await
+            .unwrap();
+        assert!(result2.is_delete_marker); // was a delete marker we deleted
+
+        // Now the object should be accessible again via the original version
+        let vid = meta.version_id.as_deref().unwrap();
+        let (_, body) = storage
+            .get_object("test-bucket", "file.txt", Some(vid))
+            .await
+            .unwrap();
+        assert_eq!(body, b"data");
+    }
+
+    #[tokio::test]
+    async fn test_list_object_versions() {
+        let (storage, _tmp) = test_storage().await;
+        create_test_bucket(&storage).await;
+        storage
+            .put_bucket_versioning("test-bucket", "Enabled")
+            .await
+            .unwrap();
+
+        // Put two versions of the same key
+        let _meta1 = storage
+            .put_object(
+                "test-bucket",
+                "file.txt",
+                b"v1",
+                "text/plain",
+                HashMap::new(),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let _meta2 = storage
+            .put_object(
+                "test-bucket",
+                "file.txt",
+                b"v2",
+                "text/plain",
+                HashMap::new(),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let result = storage
+            .list_object_versions("test-bucket", "", 1000)
+            .await
+            .unwrap();
+
+        // Should have at least 2 versions (v1 in .versions/ and v2 as current + in .versions/)
+        assert!(result.versions.len() >= 2);
+        assert!(result.delete_markers.is_empty());
+
+        // All should have key "file.txt"
+        for v in &result.versions {
+            assert_eq!(v.key, "file.txt");
+        }
+
+        // Exactly one should be marked as latest
+        let latest_count = result.versions.iter().filter(|v| v.is_latest).count();
+        assert_eq!(latest_count, 1);
+    }
+
+    #[tokio::test]
+    async fn test_list_object_versions_with_delete_marker() {
+        let (storage, _tmp) = test_storage().await;
+        create_test_bucket(&storage).await;
+        storage
+            .put_bucket_versioning("test-bucket", "Enabled")
+            .await
+            .unwrap();
+
+        let _meta = storage
+            .put_object(
+                "test-bucket",
+                "file.txt",
+                b"data",
+                "text/plain",
+                HashMap::new(),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        storage
+            .delete_object("test-bucket", "file.txt", None)
+            .await
+            .unwrap();
+
+        let result = storage
+            .list_object_versions("test-bucket", "", 1000)
+            .await
+            .unwrap();
+
+        // Should have at least 1 version and 1 delete marker
+        assert!(!result.versions.is_empty());
+        assert!(!result.delete_markers.is_empty());
+
+        // The delete marker should be the latest
+        let dm_latest = result.delete_markers.iter().any(|dm| dm.is_latest);
+        assert!(dm_latest);
+    }
+
+    #[tokio::test]
+    async fn test_list_object_versions_prefix_filter() {
+        let (storage, _tmp) = test_storage().await;
+        create_test_bucket(&storage).await;
+        storage
+            .put_bucket_versioning("test-bucket", "Enabled")
+            .await
+            .unwrap();
+
+        storage
+            .put_object(
+                "test-bucket",
+                "docs/a.txt",
+                b"data",
+                "text/plain",
+                HashMap::new(),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        storage
+            .put_object(
+                "test-bucket",
+                "photos/b.jpg",
+                b"image data",
+                "image/jpeg",
+                HashMap::new(),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let result = storage
+            .list_object_versions("test-bucket", "docs/", 1000)
+            .await
+            .unwrap();
+
+        // Should only contain docs/a.txt versions
+        for v in &result.versions {
+            assert!(v.key.starts_with("docs/"));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_delete_bucket_with_versioning_config() {
+        let (storage, _tmp) = test_storage().await;
+        create_test_bucket(&storage).await;
+
+        storage
+            .put_bucket_versioning("test-bucket", "Enabled")
+            .await
+            .unwrap();
+
+        // Create .versions dir
+        let versions_dir = storage.versions_dir("test-bucket");
+        tokio::fs::create_dir_all(&versions_dir).await.unwrap();
+
+        // Delete bucket should succeed since only internal entries remain
+        storage.delete_bucket("test-bucket").await.unwrap();
+        assert!(!storage.bucket_exists("test-bucket"));
+    }
+
+    #[tokio::test]
+    async fn test_unversioned_delete_returns_no_version() {
+        let (storage, _tmp) = test_storage().await;
+        create_test_bucket(&storage).await;
+
+        put_test_object(&storage, "file.txt").await;
+
+        let result = storage
+            .delete_object("test-bucket", "file.txt", None)
+            .await
+            .unwrap();
+
+        assert!(result.version_id.is_none());
+        assert!(!result.is_delete_marker);
+    }
+
+    #[tokio::test]
+    async fn test_suspended_versioning_uses_null_version() {
+        let (storage, _tmp) = test_storage().await;
+        create_test_bucket(&storage).await;
+
+        storage
+            .put_bucket_versioning("test-bucket", "Suspended")
+            .await
+            .unwrap();
+
+        let meta = storage
+            .put_object(
+                "test-bucket",
+                "file.txt",
+                b"suspended",
+                "text/plain",
+                HashMap::new(),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(meta.version_id.as_deref(), Some("null"));
+    }
+
+    #[tokio::test]
+    async fn test_versioned_get_nonexistent_version() {
+        let (storage, _tmp) = test_storage().await;
+        create_test_bucket(&storage).await;
+        storage
+            .put_bucket_versioning("test-bucket", "Enabled")
+            .await
+            .unwrap();
+
+        put_test_object(&storage, "file.txt").await;
+
+        let err = storage
+            .get_object("test-bucket", "file.txt", Some("nonexistent-version"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, S3Error::NoSuchKey { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_versioned_three_versions_get_each() {
+        let (storage, _tmp) = test_storage().await;
+        create_test_bucket(&storage).await;
+        storage
+            .put_bucket_versioning("test-bucket", "Enabled")
+            .await
+            .unwrap();
+
+        let meta1 = storage
+            .put_object(
+                "test-bucket",
+                "file.txt",
+                b"aaa",
+                "text/plain",
+                HashMap::new(),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let meta2 = storage
+            .put_object(
+                "test-bucket",
+                "file.txt",
+                b"bbb",
+                "text/plain",
+                HashMap::new(),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let meta3 = storage
+            .put_object(
+                "test-bucket",
+                "file.txt",
+                b"ccc",
+                "text/plain",
+                HashMap::new(),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Get each by version
+        let vid1 = meta1.version_id.as_deref().unwrap();
+        let vid2 = meta2.version_id.as_deref().unwrap();
+        let vid3 = meta3.version_id.as_deref().unwrap();
+
+        let (_, b1) = storage
+            .get_object("test-bucket", "file.txt", Some(vid1))
+            .await
+            .unwrap();
+        let (_, b2) = storage
+            .get_object("test-bucket", "file.txt", Some(vid2))
+            .await
+            .unwrap();
+        let (_, b3) = storage
+            .get_object("test-bucket", "file.txt", Some(vid3))
+            .await
+            .unwrap();
+
+        assert_eq!(b1, b"aaa");
+        assert_eq!(b2, b"bbb");
+        assert_eq!(b3, b"ccc");
+
+        // Latest should be v3
+        let (_, latest) = storage
+            .get_object("test-bucket", "file.txt", None)
+            .await
+            .unwrap();
+        assert_eq!(latest, b"ccc");
+    }
+
+    #[tokio::test]
+    async fn test_versioned_delete_current_restores_previous() {
+        let (storage, _tmp) = test_storage().await;
+        create_test_bucket(&storage).await;
+        storage
+            .put_bucket_versioning("test-bucket", "Enabled")
+            .await
+            .unwrap();
+
+        let _meta1 = storage
+            .put_object(
+                "test-bucket",
+                "file.txt",
+                b"first",
+                "text/plain",
+                HashMap::new(),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let meta2 = storage
+            .put_object(
+                "test-bucket",
+                "file.txt",
+                b"second",
+                "text/plain",
+                HashMap::new(),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Delete the current version (v2) by its version_id
+        let vid2 = meta2.version_id.as_deref().unwrap();
+        storage
+            .delete_object("test-bucket", "file.txt", Some(vid2))
+            .await
+            .unwrap();
+
+        // The current object should now be restored from v1
+        let (_, body) = storage
+            .get_object("test-bucket", "file.txt", None)
+            .await
+            .unwrap();
+        assert_eq!(body, b"first");
+    }
+
+    #[tokio::test]
+    async fn test_list_object_versions_empty_bucket() {
+        let (storage, _tmp) = test_storage().await;
+        create_test_bucket(&storage).await;
+        storage
+            .put_bucket_versioning("test-bucket", "Enabled")
+            .await
+            .unwrap();
+
+        let result = storage
+            .list_object_versions("test-bucket", "", 1000)
+            .await
+            .unwrap();
+
+        assert!(result.versions.is_empty());
+        assert!(result.delete_markers.is_empty());
+        assert!(!result.is_truncated);
+    }
+
+    #[tokio::test]
+    async fn test_get_delete_marker_by_version_returns_method_not_allowed() {
+        let (storage, _tmp) = test_storage().await;
+        create_test_bucket(&storage).await;
+        storage
+            .put_bucket_versioning("test-bucket", "Enabled")
+            .await
+            .unwrap();
+
+        storage
+            .put_object(
+                "test-bucket",
+                "file.txt",
+                b"data",
+                "text/plain",
+                HashMap::new(),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let del_result = storage
+            .delete_object("test-bucket", "file.txt", None)
+            .await
+            .unwrap();
+
+        let dm_vid = del_result.version_id.as_deref().unwrap();
+
+        // GET a delete marker by version ID should return MethodNotAllowed
+        let err = storage
+            .get_object("test-bucket", "file.txt", Some(dm_vid))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, S3Error::MethodNotAllowed { .. }));
+
+        // HEAD a delete marker by version ID should also return MethodNotAllowed
+        let err = storage
+            .head_object("test-bucket", "file.txt", Some(dm_vid))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, S3Error::MethodNotAllowed { .. }));
+    }
+
+    // --- Bucket Policy tests ---
+
+    #[tokio::test]
+    async fn test_put_and_get_bucket_policy() {
+        let (storage, _tmp) = test_storage().await;
+        storage
+            .create_bucket("test-bucket", "us-east-1")
+            .await
+            .unwrap();
+
+        let policy = r#"{"Version":"2012-10-17","Statement":[]}"#;
+        storage
+            .put_bucket_policy("test-bucket", policy)
+            .await
+            .unwrap();
+
+        let got = storage.get_bucket_policy("test-bucket").await.unwrap();
+        assert_eq!(got, policy);
+    }
+
+    #[tokio::test]
+    async fn test_get_bucket_policy_not_set() {
+        let (storage, _tmp) = test_storage().await;
+        storage
+            .create_bucket("test-bucket", "us-east-1")
+            .await
+            .unwrap();
+
+        let err = storage.get_bucket_policy("test-bucket").await.unwrap_err();
+        assert!(matches!(err, S3Error::NoSuchBucketPolicy { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_delete_bucket_policy() {
+        let (storage, _tmp) = test_storage().await;
+        storage
+            .create_bucket("test-bucket", "us-east-1")
+            .await
+            .unwrap();
+
+        let policy = r#"{"Version":"2012-10-17","Statement":[]}"#;
+        storage
+            .put_bucket_policy("test-bucket", policy)
+            .await
+            .unwrap();
+
+        storage.delete_bucket_policy("test-bucket").await.unwrap();
+
+        let err = storage.get_bucket_policy("test-bucket").await.unwrap_err();
+        assert!(matches!(err, S3Error::NoSuchBucketPolicy { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_delete_bucket_policy_idempotent() {
+        let (storage, _tmp) = test_storage().await;
+        storage
+            .create_bucket("test-bucket", "us-east-1")
+            .await
+            .unwrap();
+
+        // Deleting when no policy exists should succeed silently
+        storage.delete_bucket_policy("test-bucket").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_bucket_policy_no_such_bucket() {
+        let (storage, _tmp) = test_storage().await;
+
+        let err = storage
+            .put_bucket_policy("no-bucket", "{}")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, S3Error::NoSuchBucket { .. }));
+
+        let err = storage.get_bucket_policy("no-bucket").await.unwrap_err();
+        assert!(matches!(err, S3Error::NoSuchBucket { .. }));
+
+        let err = storage.delete_bucket_policy("no-bucket").await.unwrap_err();
+        assert!(matches!(err, S3Error::NoSuchBucket { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_put_bucket_policy_overwrite() {
+        let (storage, _tmp) = test_storage().await;
+        storage
+            .create_bucket("test-bucket", "us-east-1")
+            .await
+            .unwrap();
+
+        storage
+            .put_bucket_policy("test-bucket", r#"{"v":1}"#)
+            .await
+            .unwrap();
+        storage
+            .put_bucket_policy("test-bucket", r#"{"v":2}"#)
+            .await
+            .unwrap();
+
+        let got = storage.get_bucket_policy("test-bucket").await.unwrap();
+        assert_eq!(got, r#"{"v":2}"#);
+    }
+
+    // --- Bucket ACL tests ---
+
+    #[tokio::test]
+    async fn test_get_bucket_acl_default() {
+        let (storage, _tmp) = test_storage().await;
+        storage
+            .create_bucket("test-bucket", "us-east-1")
+            .await
+            .unwrap();
+
+        let acl = storage.get_bucket_acl("test-bucket").await.unwrap();
+        assert!(acl.contains("FULL_CONTROL"));
+        assert!(acl.contains("local-s3-owner-id"));
+    }
+
+    #[tokio::test]
+    async fn test_put_and_get_bucket_acl() {
+        let (storage, _tmp) = test_storage().await;
+        storage
+            .create_bucket("test-bucket", "us-east-1")
+            .await
+            .unwrap();
+
+        let custom_acl = "<AccessControlPolicy>custom</AccessControlPolicy>";
+        storage
+            .put_bucket_acl("test-bucket", custom_acl)
+            .await
+            .unwrap();
+
+        let got = storage.get_bucket_acl("test-bucket").await.unwrap();
+        assert_eq!(got, custom_acl);
+    }
+
+    #[tokio::test]
+    async fn test_bucket_acl_no_such_bucket() {
+        let (storage, _tmp) = test_storage().await;
+
+        let err = storage
+            .put_bucket_acl("no-bucket", "<acl/>")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, S3Error::NoSuchBucket { .. }));
+
+        let err = storage.get_bucket_acl("no-bucket").await.unwrap_err();
+        assert!(matches!(err, S3Error::NoSuchBucket { .. }));
+    }
+
+    // --- Object ACL tests ---
+
+    #[tokio::test]
+    async fn test_get_object_acl_default() {
+        let (storage, _tmp) = test_storage().await;
+        storage
+            .create_bucket("test-bucket", "us-east-1")
+            .await
+            .unwrap();
+        storage
+            .put_object(
+                "test-bucket",
+                "file.txt",
+                b"hello",
+                "text/plain",
+                HashMap::new(),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let acl = storage
+            .get_object_acl("test-bucket", "file.txt")
+            .await
+            .unwrap();
+        assert!(acl.contains("FULL_CONTROL"));
+        assert!(acl.contains("local-s3-owner-id"));
+    }
+
+    #[tokio::test]
+    async fn test_put_and_get_object_acl() {
+        let (storage, _tmp) = test_storage().await;
+        storage
+            .create_bucket("test-bucket", "us-east-1")
+            .await
+            .unwrap();
+        storage
+            .put_object(
+                "test-bucket",
+                "file.txt",
+                b"hello",
+                "text/plain",
+                HashMap::new(),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let custom_acl = "<AccessControlPolicy>custom-object</AccessControlPolicy>";
+        storage
+            .put_object_acl("test-bucket", "file.txt", custom_acl)
+            .await
+            .unwrap();
+
+        let got = storage
+            .get_object_acl("test-bucket", "file.txt")
+            .await
+            .unwrap();
+        assert_eq!(got, custom_acl);
+    }
+
+    #[tokio::test]
+    async fn test_object_acl_no_such_key() {
+        let (storage, _tmp) = test_storage().await;
+        storage
+            .create_bucket("test-bucket", "us-east-1")
+            .await
+            .unwrap();
+
+        let err = storage
+            .put_object_acl("test-bucket", "missing.txt", "<acl/>")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, S3Error::NoSuchKey { .. }));
+
+        let err = storage
+            .get_object_acl("test-bucket", "missing.txt")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, S3Error::NoSuchKey { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_object_acl_no_such_bucket() {
+        let (storage, _tmp) = test_storage().await;
+
+        let err = storage
+            .put_object_acl("no-bucket", "file.txt", "<acl/>")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, S3Error::NoSuchBucket { .. }));
+
+        let err = storage
+            .get_object_acl("no-bucket", "file.txt")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, S3Error::NoSuchBucket { .. }));
+    }
+
+    // --- Lifecycle Configuration tests ---
+
+    #[tokio::test]
+    async fn test_put_and_get_bucket_lifecycle() {
+        let (storage, _tmp) = test_storage().await;
+        storage
+            .create_bucket("test-bucket", "us-east-1")
+            .await
+            .unwrap();
+
+        let lifecycle = "<LifecycleConfiguration><Rule><Status>Enabled</Status></Rule></LifecycleConfiguration>";
+        storage
+            .put_bucket_lifecycle("test-bucket", lifecycle)
+            .await
+            .unwrap();
+
+        let got = storage.get_bucket_lifecycle("test-bucket").await.unwrap();
+        assert_eq!(got, lifecycle);
+    }
+
+    #[tokio::test]
+    async fn test_get_bucket_lifecycle_not_set() {
+        let (storage, _tmp) = test_storage().await;
+        storage
+            .create_bucket("test-bucket", "us-east-1")
+            .await
+            .unwrap();
+
+        let err = storage
+            .get_bucket_lifecycle("test-bucket")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, S3Error::NoSuchLifecycleConfiguration { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_delete_bucket_lifecycle() {
+        let (storage, _tmp) = test_storage().await;
+        storage
+            .create_bucket("test-bucket", "us-east-1")
+            .await
+            .unwrap();
+
+        let lifecycle = "<LifecycleConfiguration/>";
+        storage
+            .put_bucket_lifecycle("test-bucket", lifecycle)
+            .await
+            .unwrap();
+
+        storage
+            .delete_bucket_lifecycle("test-bucket")
+            .await
+            .unwrap();
+
+        let err = storage
+            .get_bucket_lifecycle("test-bucket")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, S3Error::NoSuchLifecycleConfiguration { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_delete_bucket_lifecycle_idempotent() {
+        let (storage, _tmp) = test_storage().await;
+        storage
+            .create_bucket("test-bucket", "us-east-1")
+            .await
+            .unwrap();
+
+        // Deleting when no lifecycle exists should succeed silently
+        storage
+            .delete_bucket_lifecycle("test-bucket")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_bucket_lifecycle_no_such_bucket() {
+        let (storage, _tmp) = test_storage().await;
+
+        let err = storage
+            .put_bucket_lifecycle("no-bucket", "<xml/>")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, S3Error::NoSuchBucket { .. }));
+
+        let err = storage.get_bucket_lifecycle("no-bucket").await.unwrap_err();
+        assert!(matches!(err, S3Error::NoSuchBucket { .. }));
+
+        let err = storage
+            .delete_bucket_lifecycle("no-bucket")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, S3Error::NoSuchBucket { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_put_bucket_lifecycle_overwrite() {
+        let (storage, _tmp) = test_storage().await;
+        storage
+            .create_bucket("test-bucket", "us-east-1")
+            .await
+            .unwrap();
+
+        storage
+            .put_bucket_lifecycle("test-bucket", "<v1/>")
+            .await
+            .unwrap();
+        storage
+            .put_bucket_lifecycle("test-bucket", "<v2/>")
+            .await
+            .unwrap();
+
+        let got = storage.get_bucket_lifecycle("test-bucket").await.unwrap();
+        assert_eq!(got, "<v2/>");
+    }
+
+    // --- is_internal_entry tests for new entries ---
+
+    #[tokio::test]
+    async fn test_is_internal_entry_policy() {
+        assert!(FileSystemStorage::is_internal_entry(".policy.json"));
+    }
+
+    #[tokio::test]
+    async fn test_is_internal_entry_acl() {
+        assert!(FileSystemStorage::is_internal_entry(".acl.xml"));
+        assert!(FileSystemStorage::is_internal_entry(".acls"));
+    }
+
+    #[tokio::test]
+    async fn test_is_internal_entry_lifecycle() {
+        assert!(FileSystemStorage::is_internal_entry(".lifecycle.xml"));
+    }
+
+    // --- Bucket with policy/acl/lifecycle can still be deleted ---
+
+    #[tokio::test]
+    async fn test_delete_bucket_with_policy_and_acl_and_lifecycle() {
+        let (storage, _tmp) = test_storage().await;
+        storage
+            .create_bucket("test-bucket", "us-east-1")
+            .await
+            .unwrap();
+
+        storage
+            .put_bucket_policy("test-bucket", r#"{"Statement":[]}"#)
+            .await
+            .unwrap();
+        storage
+            .put_bucket_acl("test-bucket", "<acl/>")
+            .await
+            .unwrap();
+        storage
+            .put_bucket_lifecycle("test-bucket", "<lifecycle/>")
+            .await
+            .unwrap();
+
+        // Should succeed because policy/acl/lifecycle are internal entries
+        storage.delete_bucket("test-bucket").await.unwrap();
+        assert!(!storage.bucket_exists("test-bucket"));
     }
 }

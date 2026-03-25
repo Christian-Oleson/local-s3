@@ -313,6 +313,64 @@ pub struct Tag {
     pub value: String,
 }
 
+// --- Versioning Configuration ---
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename = "VersioningConfiguration")]
+pub struct VersioningConfiguration {
+    #[serde(rename = "@xmlns", skip_serializing_if = "Option::is_none", default)]
+    pub xmlns: Option<String>,
+    #[serde(rename = "Status", skip_serializing_if = "Option::is_none", default)]
+    pub status: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename = "ListVersionsResult")]
+pub struct ListVersionsResult {
+    #[serde(rename = "@xmlns")]
+    pub xmlns: String,
+    #[serde(rename = "Name")]
+    pub name: String,
+    #[serde(rename = "Prefix")]
+    pub prefix: String,
+    #[serde(rename = "MaxKeys")]
+    pub max_keys: i32,
+    #[serde(rename = "IsTruncated")]
+    pub is_truncated: bool,
+    #[serde(rename = "Version", default)]
+    pub versions: Vec<VersionEntry>,
+    #[serde(rename = "DeleteMarker", default)]
+    pub delete_markers: Vec<DeleteMarkerEntry>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct VersionEntry {
+    #[serde(rename = "Key")]
+    pub key: String,
+    #[serde(rename = "VersionId")]
+    pub version_id: String,
+    #[serde(rename = "IsLatest")]
+    pub is_latest: bool,
+    #[serde(rename = "LastModified")]
+    pub last_modified: String,
+    #[serde(rename = "ETag")]
+    pub etag: String,
+    #[serde(rename = "Size")]
+    pub size: u64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DeleteMarkerEntry {
+    #[serde(rename = "Key")]
+    pub key: String,
+    #[serde(rename = "VersionId")]
+    pub version_id: String,
+    #[serde(rename = "IsLatest")]
+    pub is_latest: bool,
+    #[serde(rename = "LastModified")]
+    pub last_modified: String,
+}
+
 // --- CORS Configuration ---
 
 #[derive(Debug, Serialize, Deserialize)]

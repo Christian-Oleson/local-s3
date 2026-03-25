@@ -19,4 +19,8 @@ pub struct ObjectMetadata {
     pub content_encoding: Option<String>,
     #[serde(default)]
     pub expires: Option<String>,
+    #[serde(default)]
+    pub version_id: Option<String>,
+    #[serde(default)]
+    pub is_delete_marker: bool,
 }

@@ -12,7 +12,7 @@ use crate::types::xml::{
     BucketEntry, Buckets, CORSConfiguration, CORSRuleXml, CommonPrefix, CreateBucketConfiguration,
     DeleteResult, DeletedEntry, ListAllMyBucketsResult, ListMultipartUploadsResult,
     ListObjectsV1Result, ListObjectsV2Result, LocationConstraintResponse, ObjectEntry, Owner,
-    S3_NAMESPACE, UploadEntry,
+    S3_NAMESPACE, UploadEntry, VersioningConfiguration,
 };
 
 fn xml_response(xml: String) -> Response {
@@ -47,11 +47,17 @@ pub async fn list_buckets(State(state): State<AppState>) -> Result<Response, S3E
 #[derive(Debug, Deserialize, Default)]
 pub struct BucketPutQuery {
     pub cors: Option<String>,
+    pub versioning: Option<String>,
+    pub policy: Option<String>,
+    pub acl: Option<String>,
+    pub lifecycle: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
 pub struct BucketDeleteQuery {
     pub cors: Option<String>,
+    pub policy: Option<String>,
+    pub lifecycle: Option<String>,
 }
 
 pub async fn create_bucket(
@@ -63,6 +69,26 @@ pub async fn create_bucket(
     // If ?cors is present, this is PutBucketCors
     if query.cors.is_some() {
         return handle_put_bucket_cors(&state, &bucket_name, &body).await;
+    }
+
+    // If ?versioning is present, this is PutBucketVersioning
+    if query.versioning.is_some() {
+        return handle_put_bucket_versioning(&state, &bucket_name, &body).await;
+    }
+
+    // If ?policy is present, this is PutBucketPolicy
+    if query.policy.is_some() {
+        return handle_put_bucket_policy(&state, &bucket_name, &body).await;
+    }
+
+    // If ?acl is present, this is PutBucketAcl
+    if query.acl.is_some() {
+        return handle_put_bucket_acl(&state, &bucket_name, &body).await;
+    }
+
+    // If ?lifecycle is present, this is PutBucketLifecycleConfiguration
+    if query.lifecycle.is_some() {
+        return handle_put_bucket_lifecycle(&state, &bucket_name, &body).await;
     }
 
     let region = if body.is_empty() {
@@ -95,6 +121,18 @@ pub async fn delete_bucket(
     // If ?cors is present, this is DeleteBucketCors
     if query.cors.is_some() {
         state.storage.delete_bucket_cors(&bucket_name).await?;
+        return Ok(StatusCode::NO_CONTENT.into_response());
+    }
+
+    // If ?policy is present, this is DeleteBucketPolicy
+    if query.policy.is_some() {
+        state.storage.delete_bucket_policy(&bucket_name).await?;
+        return Ok(StatusCode::NO_CONTENT.into_response());
+    }
+
+    // If ?lifecycle is present, this is DeleteBucketLifecycle
+    if query.lifecycle.is_some() {
+        state.storage.delete_bucket_lifecycle(&bucket_name).await?;
         return Ok(StatusCode::NO_CONTENT.into_response());
     }
 
@@ -131,6 +169,11 @@ pub struct BucketGetQuery {
     pub marker: Option<String>,
     pub uploads: Option<String>,
     pub cors: Option<String>,
+    pub versioning: Option<String>,
+    pub versions: Option<String>,
+    pub policy: Option<String>,
+    pub acl: Option<String>,
+    pub lifecycle: Option<String>,
 }
 
 pub async fn get_bucket(
@@ -138,9 +181,34 @@ pub async fn get_bucket(
     Path(bucket_name): Path<String>,
     Query(query): Query<BucketGetQuery>,
 ) -> Result<Response, S3Error> {
+    // Check if this is a ?versioning request (GetBucketVersioning)
+    if query.versioning.is_some() {
+        return handle_get_bucket_versioning(&state, &bucket_name).await;
+    }
+
+    // Check if this is a ?versions request (ListObjectVersions)
+    if query.versions.is_some() {
+        return handle_list_object_versions(&state, &bucket_name, &query).await;
+    }
+
     // Check if this is a ?cors request (GetBucketCors)
     if query.cors.is_some() {
         return handle_get_bucket_cors(&state, &bucket_name).await;
+    }
+
+    // Check if this is a ?policy request (GetBucketPolicy)
+    if query.policy.is_some() {
+        return handle_get_bucket_policy(&state, &bucket_name).await;
+    }
+
+    // Check if this is a ?acl request (GetBucketAcl)
+    if query.acl.is_some() {
+        return handle_get_bucket_acl(&state, &bucket_name).await;
+    }
+
+    // Check if this is a ?lifecycle request (GetBucketLifecycleConfiguration)
+    if query.lifecycle.is_some() {
+        return handle_get_bucket_lifecycle(&state, &bucket_name).await;
     }
 
     // Check if this is a ?uploads request (ListMultipartUploads)
@@ -341,6 +409,71 @@ async fn list_multipart_uploads_handler(
     Ok(xml_response(xml))
 }
 
+// --- Versioning handlers ---
+
+async fn handle_put_bucket_versioning(
+    state: &AppState,
+    bucket_name: &str,
+    body: &[u8],
+) -> Result<Response, S3Error> {
+    let config: VersioningConfiguration =
+        quick_xml::de::from_reader(body).map_err(|e| S3Error::InternalError {
+            message: format!("Failed to parse VersioningConfiguration XML: {e}"),
+        })?;
+
+    let status = config.status.unwrap_or_default();
+    if status != "Enabled" && status != "Suspended" {
+        return Err(S3Error::InternalError {
+            message: format!("Invalid versioning status: {status}"),
+        });
+    }
+
+    state
+        .storage
+        .put_bucket_versioning(bucket_name, &status)
+        .await?;
+
+    Ok((StatusCode::OK, [("content-length", "0")], "").into_response())
+}
+
+async fn handle_get_bucket_versioning(
+    state: &AppState,
+    bucket_name: &str,
+) -> Result<Response, S3Error> {
+    let status = state.storage.get_bucket_versioning(bucket_name).await?;
+
+    let config = VersioningConfiguration {
+        xmlns: Some(S3_NAMESPACE.to_string()),
+        status,
+    };
+
+    let xml = to_xml_string(&config).map_err(|e| S3Error::InternalError {
+        message: format!("Failed to serialize VersioningConfiguration: {e}"),
+    })?;
+
+    Ok(xml_response(xml))
+}
+
+async fn handle_list_object_versions(
+    state: &AppState,
+    bucket_name: &str,
+    query: &BucketGetQuery,
+) -> Result<Response, S3Error> {
+    let prefix = query.prefix.as_deref().unwrap_or("");
+    let max_keys = query.max_keys.unwrap_or(1000);
+
+    let result = state
+        .storage
+        .list_object_versions(bucket_name, prefix, max_keys)
+        .await?;
+
+    let xml = to_xml_string(&result).map_err(|e| S3Error::InternalError {
+        message: format!("Failed to serialize ListVersionsResult: {e}"),
+    })?;
+
+    Ok(xml_response(xml))
+}
+
 // --- CORS Configuration handlers ---
 
 async fn handle_put_bucket_cors(
@@ -391,4 +524,92 @@ async fn handle_get_bucket_cors(state: &AppState, bucket_name: &str) -> Result<R
     })?;
 
     Ok(xml_response(xml))
+}
+
+// --- Bucket Policy handlers ---
+
+async fn handle_put_bucket_policy(
+    state: &AppState,
+    bucket_name: &str,
+    body: &[u8],
+) -> Result<Response, S3Error> {
+    let policy_json = std::str::from_utf8(body).map_err(|e| S3Error::InternalError {
+        message: format!("Invalid UTF-8 in policy body: {e}"),
+    })?;
+
+    state
+        .storage
+        .put_bucket_policy(bucket_name, policy_json)
+        .await?;
+
+    Ok((StatusCode::OK, [("content-length", "0")], "").into_response())
+}
+
+async fn handle_get_bucket_policy(
+    state: &AppState,
+    bucket_name: &str,
+) -> Result<Response, S3Error> {
+    let policy = state.storage.get_bucket_policy(bucket_name).await?;
+
+    Ok((
+        StatusCode::OK,
+        [("content-type", "application/json")],
+        policy,
+    )
+        .into_response())
+}
+
+// --- Bucket ACL handlers ---
+
+async fn handle_put_bucket_acl(
+    state: &AppState,
+    bucket_name: &str,
+    body: &[u8],
+) -> Result<Response, S3Error> {
+    let acl_xml = std::str::from_utf8(body).map_err(|e| S3Error::InternalError {
+        message: format!("Invalid UTF-8 in ACL body: {e}"),
+    })?;
+
+    state.storage.put_bucket_acl(bucket_name, acl_xml).await?;
+
+    Ok((StatusCode::OK, [("content-length", "0")], "").into_response())
+}
+
+async fn handle_get_bucket_acl(state: &AppState, bucket_name: &str) -> Result<Response, S3Error> {
+    let acl = state.storage.get_bucket_acl(bucket_name).await?;
+
+    Ok((StatusCode::OK, [("content-type", "application/xml")], acl).into_response())
+}
+
+// --- Lifecycle Configuration handlers ---
+
+async fn handle_put_bucket_lifecycle(
+    state: &AppState,
+    bucket_name: &str,
+    body: &[u8],
+) -> Result<Response, S3Error> {
+    let lifecycle_xml = std::str::from_utf8(body).map_err(|e| S3Error::InternalError {
+        message: format!("Invalid UTF-8 in lifecycle body: {e}"),
+    })?;
+
+    state
+        .storage
+        .put_bucket_lifecycle(bucket_name, lifecycle_xml)
+        .await?;
+
+    Ok((StatusCode::OK, [("content-length", "0")], "").into_response())
+}
+
+async fn handle_get_bucket_lifecycle(
+    state: &AppState,
+    bucket_name: &str,
+) -> Result<Response, S3Error> {
+    let lifecycle = state.storage.get_bucket_lifecycle(bucket_name).await?;
+
+    Ok((
+        StatusCode::OK,
+        [("content-type", "application/xml")],
+        lifecycle,
+    )
+        .into_response())
 }
