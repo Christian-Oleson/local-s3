@@ -1,142 +1,139 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!-- Dos Apes Super Agent Framework - Phase Plan -->
 <!-- Generated: 2026-03-25 -->
-<!-- Phase: 3 -->
+<!-- Phase: 4 -->
 
 <plan>
   <metadata>
-    <phase>3</phase>
-    <name>Multipart Upload &amp; Advanced Features</name>
-    <goal>Support large file uploads and commonly-used S3 features (tagging, range requests, CORS, conditional requests)</goal>
-    <deliverable>Full multipart upload lifecycle, object tagging, range reads, and CORS — covers P1 requirements</deliverable>
+    <phase>4</phase>
+    <name>Versioning &amp; Configuration Storage</name>
+    <goal>Bucket versioning support and storage of bucket configurations (policies, ACLs, lifecycle) without enforcement</goal>
+    <deliverable>Apps that use versioning work correctly; bucket configs are accepted and stored</deliverable>
     <created>2026-03-25</created>
   </metadata>
 
   <context>
-    <dependencies>Phase 2 complete — full object CRUD, copy, batch delete, list operations, 71 tests</dependencies>
+    <dependencies>Phase 3 complete — multipart, range, conditional, tagging, CORS, 133 tests</dependencies>
     <affected_areas>
-      - src/storage/filesystem.rs — multipart upload state, tagging, CORS config storage
-      - src/routes/object.rs — multipart handlers, tagging handlers, range/conditional on GET
-      - src/routes/bucket.rs — CORS config handlers, multipart upload initiation
-      - src/server.rs — new POST routes for multipart, tagging sub-resources
-      - src/types/xml.rs — multipart XML types, tagging XML types
-      - src/error.rs — new error variants (NoSuchUpload, InvalidPart, etc.)
-      - src/middleware.rs — CORS preflight handling
+      - src/storage/filesystem.rs — versioning state, versioned object storage, config storage
+      - src/routes/object.rs — ?versionId on GET/HEAD/DELETE, version ID in PUT response
+      - src/routes/bucket.rs — versioning/policy/ACL/lifecycle config handlers
+      - src/server.rs — virtual-hosted-style routing (optional)
+      - src/types/xml.rs — versioning, ListObjectVersions, policy, ACL, lifecycle XML types
+      - src/types/object.rs — add version_id field to ObjectMetadata
+      - src/error.rs — new error variants
     </affected_areas>
     <patterns_to_follow>
-      - Multipart upload state stored at {bucket}/.uploads/{upload_id}/ with part files and state.json
-      - Composite ETag for multipart: MD5 of concatenated part MD5s, suffixed with "-{part_count}"
-      - Tagging stored in metadata sidecar (extend ObjectMetadata with tags field)
-      - CORS config stored as {bucket}/.cors.json
-      - Follow existing patterns: xml_response(), S3Error, State(AppState) extractors
-      - POST /{bucket}/{key}?uploads → CreateMultipartUpload
-      - PUT /{bucket}/{key}?partNumber=N&amp;uploadId=X → UploadPart
-      - POST /{bucket}/{key}?uploadId=X → CompleteMultipartUpload
-      - DELETE /{bucket}/{key}?uploadId=X → AbortMultipartUpload
+      - Versioning config at {bucket}/.versioning.json
+      - When versioning enabled: each PUT generates UUID version_id, old versions preserved
+      - Versions stored at {bucket}/.versions/{key}/{version_id}.data + {version_id}.meta.json
+      - Delete on versioned bucket creates delete marker (version with is_delete_marker=true, no data)
+      - DELETE with ?versionId permanently removes that specific version
+      - GET/HEAD with ?versionId retrieves specific version
+      - Config files: {bucket}/.policy.json, {bucket}/.acl.json, {bucket}/.lifecycle.json
+      - Store-only configs: accept and return, no enforcement
+      - Follow existing patterns: query param dispatch, xml_response(), S3Error
     </patterns_to_follow>
   </context>
 
   <tasks>
     <task id="1" type="backend" complete="false">
-      <name>Multipart upload lifecycle: create, upload parts, complete, abort, list</name>
+      <name>Bucket versioning and versioned object operations</name>
       <description>
-        Implement the full multipart upload lifecycle: CreateMultipartUpload, UploadPart,
-        CompleteMultipartUpload, AbortMultipartUpload, ListParts, ListMultipartUploads.
-        Storage layer stores parts as individual files, assembly concatenates them.
-        Includes all XML types and HTTP handlers.
+        Implement PutBucketVersioning/GetBucketVersioning, versioned object storage with
+        version IDs, ListObjectVersions, GET/HEAD/DELETE with ?versionId, and delete markers.
+        This is the most complex task — it modifies the core object storage behavior.
       </description>
 
       <files>
-        <modify>src/storage/filesystem.rs — multipart methods + upload state management</modify>
-        <modify>src/routes/object.rs — multipart handlers (dispatch on query params)</modify>
-        <modify>src/routes/bucket.rs — ListMultipartUploads handler (GET ?uploads)</modify>
-        <modify>src/server.rs — POST routes for /{bucket}/{*key} (multipart create + complete)</modify>
-        <modify>src/types/xml.rs — multipart XML types</modify>
-        <modify>src/error.rs — NoSuchUpload, InvalidPart error variants</modify>
+        <modify>src/storage/filesystem.rs — versioning config, versioned put/get/head/delete, list versions</modify>
+        <modify>src/routes/object.rs — ?versionId dispatch on GET/HEAD/DELETE, version headers on PUT</modify>
+        <modify>src/routes/bucket.rs — versioning config handlers, ListObjectVersions handler</modify>
+        <modify>src/types/xml.rs — versioning XML types, ListObjectVersions types</modify>
+        <modify>src/types/object.rs — add version_id to ObjectMetadata</modify>
+        <modify>src/error.rs — MethodNotAllowed for delete marker access</modify>
+        <modify>src/server.rs — if any route changes needed</modify>
       </files>
 
       <action>
-        1. Add error variants to src/error.rs:
-           - NoSuchUpload { upload_id: String } → 404
-           - InvalidPart { message: String } → 400
-           Add corresponding code(), status_code(), resource() implementations.
+        1. Add to src/types/object.rs:
+           - Add `version_id: Option&lt;String&gt;` field to ObjectMetadata (with serde default)
+           - Add `is_delete_marker: bool` field (with serde default false)
 
         2. Add XML types to src/types/xml.rs:
 
-           InitiateMultipartUploadResult:
-           - Bucket, Key, UploadId
+           VersioningConfiguration (serialize + deserialize):
+           - Status: Option&lt;String&gt; ("Enabled" or "Suspended")
 
-           CompleteMultipartUploadResult:
-           - Location, Bucket, Key, ETag
+           ListVersionsResult:
+           - xmlns, Name, Prefix, MaxKeys, IsTruncated, KeyMarker, VersionIdMarker
+           - Version entries: Vec with Key, VersionId, IsLatest, LastModified, ETag, Size
+           - DeleteMarker entries: Vec with Key, VersionId, IsLatest, LastModified
 
-           CompleteMultipartUploadRequest (deserialize):
-           - Part entries: Vec with PartNumber and ETag
+        3. Storage layer — versioning config:
+           - Store at {bucket}/.versioning.json: { "status": "Enabled" | "Suspended" }
+           - put_bucket_versioning(bucket, status) → Result&lt;()&gt;
+           - get_bucket_versioning(bucket) → Result&lt;Option&lt;String&gt;&gt; (None if never set)
+           - is_versioning_enabled(bucket) → bool
+           - Update is_internal_entry to match ".versioning.json" and ".versions"
 
-           ListPartsResult:
-           - Bucket, Key, UploadId, PartNumberMarker, NextPartNumberMarker,
-             MaxParts, IsTruncated, Parts (Vec with PartNumber, LastModified, ETag, Size)
+        4. Storage layer — versioned object storage:
 
-           ListMultipartUploadsResult:
-           - Bucket, KeyMarker, UploadIdMarker, NextKeyMarker, NextUploadIdMarker,
-             MaxUploads, IsTruncated, Uploads (Vec with Key, UploadId, Initiated)
+           When versioning is ENABLED:
 
-        3. Storage layer — multipart state management:
+           a) put_object: Generate UUID version_id. Store object normally at {bucket}/{key}
+              AND save a copy at {bucket}/.versions/{key}/{version_id}.data with metadata
+              at {bucket}/.versions/{key}/{version_id}.meta.json.
+              Set version_id on the returned ObjectMetadata.
+              The "current" object always lives at the normal path.
 
-           Upload state stored at: {bucket}/.uploads/{upload_id}/
-           - state.json: { key, upload_id, initiated, parts: {} }
-           - part files: {part_number}.part (raw bytes)
+           b) get_object: If no ?versionId, return current object (same as before).
+              If ?versionId specified, read from .versions/{key}/{version_id}.
 
-           Methods:
-           a) create_multipart_upload(bucket, key) → Result&lt;String&gt; (returns upload_id)
-              - Verify bucket exists
-              - Generate UUID upload_id
-              - Create upload directory + state.json
-              - Return upload_id
+           c) head_object: Same logic — with or without ?versionId.
 
-           b) upload_part(bucket, key, upload_id, part_number, body) → Result&lt;String&gt; (returns ETag)
-              - Verify upload exists
-              - Write part body to {part_number}.part
-              - Compute MD5 ETag for the part
-              - Update state.json with part info
-              - Return part ETag
+           d) delete_object (no versionId): Create a delete marker.
+              - Generate a new version_id for the delete marker
+              - Save a delete marker entry in .versions/{key}/{version_id}.meta.json
+                with is_delete_marker=true and no data file
+              - Remove the "current" object file and metadata (so GET without versionId returns 404)
+              - Return the delete marker's version_id and x-amz-delete-marker: true header
 
-           c) complete_multipart_upload(bucket, key, upload_id, parts) → Result&lt;ObjectMetadata&gt;
-              - Verify upload exists and all specified parts exist
-              - Concatenate parts in order to create final object body
-              - Compute composite ETag: MD5(concat(part_md5_bytes)) + "-{part_count}"
-              - Write assembled object via put_object
-              - Clean up upload directory
-              - Return metadata with composite ETag
+           e) delete_object (with versionId): Permanently remove that specific version.
+              - Delete {version_id}.data and {version_id}.meta.json from .versions/
+              - If deleting the version that was "current", the previous version becomes current
+                (or if it was a delete marker, just remove it)
 
-           d) abort_multipart_upload(bucket, key, upload_id) → Result&lt;()&gt;
-              - Verify upload exists
-              - Remove entire upload directory
-              - Return Ok
+           When versioning is DISABLED or SUSPENDED:
+           - put_object: Same as current behavior (no version tracking)
+              If suspended: still generate version_id "null" for new puts
+           - delete_object: Same as current (actual delete, no marker)
 
-           e) list_parts(bucket, upload_id, max_parts, part_number_marker) → Result&lt;...&gt;
-              - Read state.json, return part info
+        5. list_object_versions(bucket, prefix, max_keys, key_marker, version_id_marker):
+           - Scan .versions/{key}/ directories for all version metadata
+           - Include current version too
+           - Sort by key, then by last_modified descending
+           - Mark latest version with IsLatest=true
+           - Separate Version entries from DeleteMarker entries
 
-           f) list_multipart_uploads(bucket, prefix, max_uploads) → Result&lt;...&gt;
-              - Scan .uploads/ directory for all active uploads
-              - Return upload info
+        6. HTTP handlers:
 
-           Also update delete_bucket to check for active uploads (or allow .uploads dir in empty check).
+           In routes/bucket.rs:
+           - Add `versioning` field to BucketGetQuery
+           - Add `versioning` field to BucketPutQuery
+           - GET /{bucket}?versioning → GetBucketVersioning
+           - PUT /{bucket}?versioning → PutBucketVersioning (parse XML body)
+           - GET /{bucket}?versions → ListObjectVersions
+           - Add `versions` field to BucketGetQuery
 
-        4. HTTP handlers in routes/object.rs:
+           In routes/object.rs:
+           - Add `versionId` field to ObjectQuery
+           - Modify get_object_handler: pass versionId to storage if present
+           - Modify head_object_handler: pass versionId
+           - Modify delete_object_handler: pass versionId
+           - PUT response: add x-amz-version-id header when versioning enabled
 
-           The key challenge: S3 uses query params to distinguish multipart operations on the same path.
-           Modify put_object_handler to check for ?partNumber and ?uploadId → dispatch to upload_part.
-           Add POST handler for /{bucket}/{*key}:
-           - If ?uploads query param → create_multipart_upload
-           - If ?uploadId query param → complete_multipart_upload
-           Add DELETE handler modification: if ?uploadId → abort_multipart_upload
-
-           For GET /{bucket}/{*key}: if ?uploadId → list_parts
-
-           For GET /{bucket}: if ?uploads query param → list_multipart_uploads (in bucket.rs)
-
-        5. Router updates in server.rs:
-           Add .post() to the /{bucket_name}/{*key} route for multipart create/complete.
+        7. Unit tests: versioning config, versioned put/get, delete markers, list versions
       </action>
 
       <verification>
@@ -147,154 +144,133 @@
       </verification>
 
       <done>
-        - Full multipart lifecycle works: create → upload parts → complete → object exists
-        - Abort cleans up all state
-        - ListParts returns correct part info
-        - ListMultipartUploads shows active uploads
-        - Composite ETag format: "md5hex-partcount"
-        - All existing 71 tests still pass
+        - Versioning enable/suspend/get works
+        - PUT with versioning enabled returns version_id
+        - GET/HEAD with ?versionId retrieves specific version
+        - DELETE on versioned bucket creates delete marker
+        - DELETE with ?versionId permanently removes version
+        - ListObjectVersions returns all versions and delete markers
+        - Non-versioned behavior unchanged
+        - All existing 133 tests pass
       </done>
     </task>
 
     <task id="2" type="backend" complete="false">
-      <name>Range requests, conditional requests, object tagging, CORS</name>
+      <name>Config storage: bucket policy, ACL, lifecycle</name>
       <description>
-        Implement Range header support on GetObject, conditional requests (If-None-Match,
-        If-Modified-Since), object tagging CRUD, and bucket CORS configuration with
-        OPTIONS preflight handling.
+        Implement store-only configuration APIs for bucket policies, ACLs, and lifecycle rules.
+        These accept and return configurations but do not enforce them — matching
+        LocalStack's behavior for local development.
       </description>
 
       <files>
-        <modify>src/routes/object.rs — range parsing, conditional headers, tagging handlers</modify>
-        <modify>src/routes/bucket.rs — CORS config handlers</modify>
-        <modify>src/storage/filesystem.rs — tagging storage, CORS config storage</modify>
-        <modify>src/types/xml.rs — tagging and CORS XML types</modify>
-        <modify>src/types/object.rs — add tags field to ObjectMetadata</modify>
-        <modify>src/server.rs — tagging and CORS routes</modify>
-        <modify>src/middleware.rs — CORS preflight response</modify>
+        <modify>src/storage/filesystem.rs — policy, ACL, lifecycle storage methods</modify>
+        <modify>src/routes/bucket.rs — config handler dispatch</modify>
+        <modify>src/types/xml.rs — ACL XML types (policy is JSON, lifecycle is XML)</modify>
+        <modify>src/error.rs — NoSuchBucketPolicy, etc.</modify>
       </files>
 
       <action>
-        1. Range requests on GetObject (routes/object.rs):
-           - Parse Range header: "bytes=start-end" or "bytes=start-" or "bytes=-suffix"
-           - Return 206 Partial Content with Content-Range header
-           - Accept-Ranges: bytes header on all GetObject responses
-           - If range is invalid or unsatisfiable: 416 Range Not Satisfiable
+        1. Bucket Policy (JSON, not XML):
+           Storage: {bucket}/.policy.json (raw JSON string, not parsed)
+           - put_bucket_policy(bucket, policy_json: String) → Result&lt;()&gt;
+           - get_bucket_policy(bucket) → Result&lt;String&gt; (returns raw JSON)
+           - delete_bucket_policy(bucket) → Result&lt;()&gt;
 
-        2. Conditional requests (routes/object.rs):
-           - If-None-Match: compare with ETag → 304 Not Modified if match
-           - If-Modified-Since: compare with Last-Modified → 304 if not modified
-           - Apply to both GetObject and HeadObject
+           HTTP: PUT/GET/DELETE /{bucket}?policy
+           - PUT body is raw JSON (Content-Type: application/json), store as-is
+           - GET returns raw JSON
+           - DELETE removes the file
+           Add NoSuchBucketPolicy error variant (404).
 
-        3. Object tagging storage (storage/filesystem.rs):
-           Store tags in a separate sidecar: {bucket}/.tags/{key}.json
-           (Don't embed in ObjectMetadata to avoid re-writing metadata on tag changes)
+        2. Bucket ACL (XML):
+           Storage: {bucket}/.acl.json
+           - put_bucket_acl(bucket, acl_xml: String) → Result&lt;()&gt; (store raw XML as string)
+           - get_bucket_acl(bucket) → Result&lt;String&gt;
 
-           Methods:
-           - put_object_tagging(bucket, key, tags: HashMap&lt;String,String&gt;) → Result&lt;()&gt;
-           - get_object_tagging(bucket, key) → Result&lt;HashMap&lt;String,String&gt;&gt;
-           - delete_object_tagging(bucket, key) → Result&lt;()&gt;
+           HTTP: PUT/GET /{bucket}?acl
+           - PUT body is XML, store as-is
+           - GET returns stored XML, or default ACL if not set
+           Default ACL: full control for owner (standard S3 default)
 
-        4. Tagging XML types (types/xml.rs):
-           - Tagging { TagSet: { Tag: Vec&lt;{Key, Value}&gt; } } (both serialize and deserialize)
+        3. Object ACL (XML):
+           Storage: {bucket}/.acls/{key}.json
+           - put_object_acl(bucket, key, acl_xml: String) → Result&lt;()&gt;
+           - get_object_acl(bucket, key) → Result&lt;String&gt;
 
-        5. Tagging HTTP handlers (routes/object.rs):
-           - PUT /{bucket}/{key}?tagging → PutObjectTagging (parse XML body)
-           - GET /{bucket}/{key}?tagging → GetObjectTagging (return XML)
-           - DELETE /{bucket}/{key}?tagging → DeleteObjectTagging
+           HTTP: PUT/GET /{bucket}/{key}?acl
+           Add ?acl dispatch to object handlers.
 
-           Dispatch: modify get/put/delete handlers to check for ?tagging query param.
+        4. Lifecycle Configuration (XML):
+           Storage: {bucket}/.lifecycle.json (store raw XML as string)
+           - put_bucket_lifecycle(bucket, lifecycle_xml: String) → Result&lt;()&gt;
+           - get_bucket_lifecycle(bucket) → Result&lt;String&gt;
+           - delete_bucket_lifecycle(bucket) → Result&lt;()&gt;
 
-        6. CORS configuration storage (storage/filesystem.rs):
-           Store as {bucket}/.cors.json
+           HTTP: PUT/GET/DELETE /{bucket}?lifecycle
+           Add NoSuchLifecycleConfiguration error variant.
 
-           Methods:
-           - put_bucket_cors(bucket, config) → Result&lt;()&gt;
-           - get_bucket_cors(bucket) → Result&lt;CorsConfiguration&gt;
-           - delete_bucket_cors(bucket) → Result&lt;()&gt;
+        5. Update is_internal_entry for: .policy.json, .acl.json, .acls, .lifecycle.json
 
-        7. CORS XML types (types/xml.rs):
-           - CORSConfiguration { CORSRule: Vec with AllowedOrigin, AllowedMethod, AllowedHeader, MaxAgeSeconds, ExposeHeader }
+        6. For all config storage: these are "accept and store" — no parsing, validation, or enforcement.
+           This makes implementation simple: just read/write files.
 
-        8. CORS HTTP handlers (routes/bucket.rs):
-           - PUT /{bucket}?cors → PutBucketCors
-           - GET /{bucket}?cors → GetBucketCors
-           - DELETE /{bucket}?cors → DeleteBucketCors
-           Add ?cors dispatch to bucket get/put/delete handlers.
+        7. Add query param dispatch in routes/bucket.rs for policy, acl, lifecycle.
+           Add acl dispatch in routes/object.rs.
 
-        9. CORS preflight (middleware.rs or routes):
-           Handle OPTIONS requests: read bucket's CORS config, return appropriate
-           Access-Control-Allow-Origin, Access-Control-Allow-Methods, etc. headers.
-           For local dev, can be permissive (allow all origins if CORS is configured).
-
-        10. Update delete_bucket empty check to allow .tags/ and .cors.json.
+        8. Unit tests for each config storage method.
       </action>
 
       <verification>
         <command>cargo build</command>
         <command>cargo test --lib</command>
         <command>cargo clippy -- -D warnings</command>
-        <command>cargo fmt -- --check</command>
       </verification>
 
       <done>
-        - Range requests return 206 with correct Content-Range
-        - If-None-Match returns 304 when ETag matches
-        - If-Modified-Since returns 304 when not modified
-        - Tagging CRUD works (put, get, delete)
-        - CORS config CRUD works (put, get, delete)
-        - OPTIONS preflight returns CORS headers
-        - All existing tests still pass
+        - Bucket policy CRUD works (raw JSON storage)
+        - Bucket ACL put/get works (raw XML storage)
+        - Object ACL put/get works
+        - Lifecycle config CRUD works (raw XML storage)
+        - All store-only — no enforcement
+        - All existing tests pass
       </done>
     </task>
 
     <task id="3" type="test" complete="false">
-      <name>Integration tests for multipart, tagging, range, CORS, conditional</name>
+      <name>Integration tests for versioning and config storage</name>
       <description>
-        Comprehensive AWS SDK integration tests for all Phase 3 features.
+        AWS SDK integration tests for versioning operations and config storage APIs.
       </description>
 
       <files>
-        <create>tests/multipart_integration.rs — multipart upload lifecycle tests</create>
-        <create>tests/advanced_integration.rs — tagging, range, conditional, CORS tests</create>
+        <create>tests/versioning_integration.rs — versioning tests</create>
+        <modify>tests/object_integration.rs — add config storage tests if needed</modify>
       </files>
 
       <action>
-        1. Multipart upload tests (tests/multipart_integration.rs):
-           - test_multipart_upload_lifecycle: create → upload 3 parts → complete → get object → verify body
-           - test_multipart_upload_abort: create → upload parts → abort → verify no object
-           - test_list_parts: create → upload parts → list parts → verify part info
-           - test_list_multipart_uploads: create multiple uploads → list → verify all shown
-           - test_multipart_etag_format: verify composite ETag has "-N" suffix
+        1. Versioning tests:
+           - test_enable_versioning: enable, verify status
+           - test_versioned_put: enable versioning, put same key twice, verify both versions exist
+           - test_get_specific_version: put 2 versions, get each by versionId
+           - test_delete_creates_marker: enable versioning, put, delete, verify 404 on GET
+           - test_delete_with_version_id: permanently remove specific version
+           - test_list_object_versions: put multiple versions, list, verify order
 
-        2. Range request tests (tests/advanced_integration.rs):
-           - test_range_request: PUT 1KB, GET with Range: bytes=0-9 → 10 bytes
-           - test_range_request_suffix: GET with Range: bytes=-5 → last 5 bytes
-
-        3. Conditional request tests:
-           - test_if_none_match: GET with matching ETag → 304
-           - test_if_modified_since: GET with future date → 304
-
-        4. Tagging tests:
-           - test_put_and_get_tagging: PUT tags, GET tags, verify round-trip
-           - test_delete_tagging: PUT tags, DELETE, GET → empty
-
-        5. CORS tests:
-           - test_put_and_get_cors: PUT CORS config, GET config, verify
-           - test_delete_cors: PUT CORS, DELETE, GET → error
+        2. Config storage tests:
+           - test_put_get_bucket_policy: put JSON policy, get back
+           - test_put_get_bucket_acl: put ACL, get back
+           - test_put_get_lifecycle: put lifecycle config, get back
       </action>
 
       <verification>
-        <command>cargo test --test multipart_integration</command>
-        <command>cargo test --test advanced_integration</command>
         <command>cargo test</command>
       </verification>
 
       <done>
-        - All multipart lifecycle tests pass with real AWS SDK
-        - Range, conditional, tagging, CORS tests pass
-        - All existing tests still pass
-        - Significant test count increase from baseline 71
+        - Versioning lifecycle fully tested via AWS SDK
+        - Config storage round-trip tested
+        - All tests passing
       </done>
     </task>
   </tasks>
@@ -306,28 +282,13 @@
       <command>cargo fmt -- --check</command>
       <command>cargo clippy -- -D warnings</command>
     </commands>
-    <manual>
-      Full multipart workflow:
-      1. Create bucket, initiate multipart upload
-      2. Upload 3 parts (each 5MB+)
-      3. Complete upload
-      4. GET object → verify full body is correct
-      5. Verify composite ETag format
-
-      Range + conditional:
-      6. GET with Range header → 206 with partial body
-      7. GET with If-None-Match: "matching-etag" → 304
-
-      Tagging:
-      8. PUT tagging, GET tagging → round-trip
-    </manual>
   </phase_verification>
 
   <completion_criteria>
     <criterion>All 3 tasks marked complete</criterion>
     <criterion>All verification commands pass</criterion>
-    <criterion>Multipart upload lifecycle fully functional via AWS SDK</criterion>
-    <criterion>Range requests return 206 with correct partial content</criterion>
+    <criterion>Versioning lifecycle works via AWS SDK</criterion>
+    <criterion>Config storage round-trips via AWS SDK</criterion>
     <criterion>No TODO comments left in new code</criterion>
   </completion_criteria>
 </plan>

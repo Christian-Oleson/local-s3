@@ -2,9 +2,15 @@
 
 ## Current Position
 
-- **Phase:** 4 - Versioning & Config Storage
-- **Task:** Not started
-- **Status:** planning
+- **Phase:** 4 - Versioning & Configuration Storage
+- **Task:** 1 (pending)
+- **Status:** planned
+
+## Plan Created
+
+- Timestamp: 2026-03-25
+- Tasks: 3
+- Estimated complexity: High (versioning is complex behavioral change)
 
 ## Progress
 
@@ -13,7 +19,7 @@
 | 1 | Foundation | :white_check_mark: Complete | 3/3 |
 | 2 | Core Object Operations | :white_check_mark: Complete | 3/3 |
 | 3 | Multipart Upload & Advanced | :white_check_mark: Complete | 3/3 |
-| 4 | Versioning & Config Storage | :arrows_counterclockwise: Pending | 0/11 |
+| 4 | Versioning & Config Storage | :arrows_counterclockwise: Planned | 0/3 |
 | 5 | Docker, CI, Polish | :hourglass_flowing_sand: Waiting | 0/10 |
 
 ## Blockers
@@ -22,23 +28,16 @@ None
 
 ## Decisions
 
-- 2026-03-25: Initialized project — Rust with axum, filesystem-backed, targeting LocalStack S3 feature parity
-- 2026-03-25: Path-style URLs as primary routing, virtual-hosted as P1
-- 2026-03-25: Accept but don't validate AWS SigV4 signatures (local dev only)
-- 2026-03-25: Target port 4566 (same as LocalStack default) for drop-in replacement
-- 2026-03-25: Object filesystem layout: data at {bucket}/{key}, metadata sidecar at {bucket}/.meta/{key}.json
-- 2026-03-25: Multipart upload state at {bucket}/.uploads/{upload_id}/ with state.json + part files
-- 2026-03-25: Tags stored separately at {bucket}/.tags/{key}.json
-- 2026-03-25: CORS config at {bucket}/.cors.json
-- 2026-03-25: Composite multipart ETag: MD5(concat(part_md5_bytes)) + "-N"
+- 2026-03-25: Versioning storage: .versions/{key}/{version_id}.data + .meta.json alongside current object
+- 2026-03-25: Delete markers: version metadata with is_delete_marker=true, no data file
+- 2026-03-25: Config storage (policy/ACL/lifecycle): store raw content, no parsing or enforcement
+- 2026-03-25: Virtual-hosted-style URLs deferred to Phase 5 (not critical for local dev with force_path_style)
 
 ## Session Log
 
-- 2026-03-25: Project initialized from requirements discussion
-- 2026-03-25: Phase 1 planned and executed (22 tests)
-- 2026-03-25: Phase 2 planned and executed (71 tests)
-- 2026-03-25: Phase 3 planned and executed (133 tests)
+- 2026-03-25: Phase 1-3 complete (133 tests)
+- 2026-03-25: Phase 4 plan created (3 tasks)
 
 ## Next Action
 
-Run `/apes-plan 4` to create Phase 4 task plan
+Run `/apes-execute 4` to start Phase 4 implementation
