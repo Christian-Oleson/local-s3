@@ -98,9 +98,23 @@ CLI flags take precedence over environment variables.
 - Error types use thiserror, map to proper S3 error codes and HTTP status
 - Async everywhere — no blocking I/O on the tokio runtime
 
+## Secrets Manager (In Progress)
+
+The project is expanding to include an AWS Secrets Manager emulator on the same port (4566). Key differences from S3:
+
+- **Protocol:** AWS JSON 1.1 (`POST /`, `X-Amz-Target: secretsmanager.<Op>`, JSON bodies) — not REST+XML
+- **Routing:** `X-Amz-Target` header starting with `secretsmanager.` routes to Secrets Manager; all else routes to S3
+- **Errors:** JSON format `{"__type": "ErrorCode", "Message": "..."}`, HTTP 400 for most client errors (including not-found)
+- **Storage:** `{data-dir}/.secrets-manager/secrets/{name}/` with `metadata.json` + `versions/{id}.json`
+
+Planning docs:
+- `PRD-secrets-manager.md` — full product requirements
+- `PROJECT-secrets-manager.md` — requirements summary
+- `ROADMAP-secrets-manager.md` — 4-phase delivery plan
+- `STATE-secrets-manager.md` — progress tracking
+
 ## Project Planning
 
 Planning documents live in `.planning/`:
-- `PROJECT.md` — requirements and scope
-- `ROADMAP.md` — phased delivery plan
-- `STATE.md` — current progress and session tracking
+- `PROJECT.md` / `ROADMAP.md` / `STATE.md` — S3 service (complete)
+- `PROJECT-secrets-manager.md` / `ROADMAP-secrets-manager.md` / `STATE-secrets-manager.md` — Secrets Manager
