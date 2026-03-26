@@ -1,143 +1,115 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!-- Dos Apes Super Agent Framework - Phase Plan -->
 <!-- Generated: 2026-03-26 -->
-<!-- Phase: SM-3 -->
+<!-- Phase: SM-4 (final) -->
 
 <plan>
   <metadata>
-    <phase>SM-3</phase>
-    <name>Version Management, Tags, Policies, Rotation</name>
-    <goal>Advanced version stage management, tagging, resource policies, rotation config storage</goal>
-    <deliverable>Full LocalStack Community parity for Secrets Manager</deliverable>
+    <phase>SM-4</phase>
+    <name>Batch Operations + Documentation</name>
+    <goal>BatchGetSecretValue, ValidateResourcePolicy, complete documentation</goal>
+    <deliverable>Complete Secrets Manager emulator ready for team adoption</deliverable>
     <created>2026-03-26</created>
   </metadata>
 
   <context>
-    <dependencies>SM Phase 2 complete — 9 SM operations implemented, 216 tests</dependencies>
+    <dependencies>SM Phase 3 complete — 17 SM operations, 221 tests</dependencies>
     <affected_areas>
-      - src/secretsmanager/storage.rs — 8 new methods (all simple CRUD)
-      - src/secretsmanager/dispatcher.rs — 8 new dispatch entries
-      - src/secretsmanager/types.rs — request/response types for 8 operations
-      - tests/secretsmanager_integration.rs — integration tests
+      - src/secretsmanager/ — 2 new operations
+      - README.md — Secrets Manager section
+      - CLAUDE.md — SM architecture update
     </affected_areas>
     <patterns_to_follow>
-      - All operations: POST / with X-Amz-Target, JSON request/response
-      - Tags stored in metadata.json tags array
-      - Resource policy stored in policy.json (raw JSON string)
-      - Rotation config stored in metadata.json (rotation_enabled, rotation_lambda_arn, rotation_rules)
-      - UpdateSecretVersionStage: move/remove labels, update version files + metadata
-      - All store-only (no enforcement, no Lambda invocation)
+      - Same dispatcher + storage + types pattern
+      - BatchGetSecretValue has partial failure semantics (SecretValues + Errors arrays)
+      - ValidateResourcePolicy just checks JSON parsability
     </patterns_to_follow>
   </context>
 
   <tasks>
     <task id="1" type="backend" complete="false">
-      <name>All 8 operations: version stages, tags, policies, rotation</name>
+      <name>BatchGetSecretValue, ValidateResourcePolicy, integration tests</name>
       <description>
-        Implement UpdateSecretVersionStage, TagResource, UntagResource,
-        PutResourcePolicy, GetResourcePolicy, DeleteResourcePolicy,
-        RotateSecret, CancelRotateSecret. All are simple storage operations.
-        Include unit tests.
+        Implement the final 2 operations plus integration tests. BatchGetSecretValue
+        retrieves multiple secrets in one call with partial failure support.
+        ValidateResourcePolicy does basic JSON validation.
       </description>
 
       <files>
-        <modify>src/secretsmanager/storage.rs    — 8 new methods</modify>
-        <modify>src/secretsmanager/dispatcher.rs — 8 new dispatch entries</modify>
-        <modify>src/secretsmanager/types.rs      — request/response types</modify>
-      </files>
-
-      <action>
-        1. UpdateSecretVersionStage:
-           Request: { SecretId, VersionStage, MoveToVersionId, RemoveFromVersionId }
-           Response: { ARN, Name }
-           - Move a staging label from one version to another
-           - Update version files on disk + metadata.version_ids_to_stages
-
-        2. TagResource:
-           Request: { SecretId, Tags: [{Key,Value}] }
-           Response: {} (empty)
-           - Additive: merge new tags into existing, overwrite on key match
-           - Update metadata.json
-
-        3. UntagResource:
-           Request: { SecretId, TagKeys: [String] }
-           Response: {} (empty)
-           - Remove matching tag keys from metadata
-
-        4. PutResourcePolicy:
-           Request: { SecretId, ResourcePolicy: String, BlockPublicPolicy: bool }
-           Response: { ARN, Name }
-           - Store raw JSON policy string in policy.json file
-
-        5. GetResourcePolicy:
-           Request: { SecretId }
-           Response: { ARN, Name, ResourcePolicy: String }
-           - Return stored policy or null if none
-
-        6. DeleteResourcePolicy:
-           Request: { SecretId }
-           Response: { ARN, Name }
-           - Delete policy.json file
-
-        7. RotateSecret:
-           Request: { SecretId, ClientRequestToken, RotationLambdaARN, RotationRules: { AutomaticallyAfterDays, Duration, ScheduleExpression }, RotateImmediately }
-           Response: { ARN, Name, VersionId }
-           - Store rotation config in metadata (rotation_enabled=true, rotation_lambda_arn, rotation_rules)
-           - Don't actually invoke Lambda — just store the config
-           - Create a new version with AWSPENDING label if RotateImmediately (default true)
-
-        8. CancelRotateSecret:
-           Request: { SecretId }
-           Response: { ARN, Name }
-           - Set rotation_enabled=false, clear AWSPENDING label
-
-        Add unit tests for each operation.
-      </action>
-
-      <verification>
-        <command>cargo build</command>
-        <command>cargo test --lib</command>
-        <command>cargo clippy -- -D warnings</command>
-        <command>cargo fmt -- --check</command>
-      </verification>
-
-      <done>
-        - All 8 operations work through dispatcher
-        - Tags are additive/removable
-        - Policy stored/returned as raw JSON string
-        - Rotation config stored in metadata
-        - All 216 existing tests pass
-      </done>
-    </task>
-
-    <task id="2" type="test" complete="false">
-      <name>Integration tests for all Phase 3 operations</name>
-      <description>
-        AWS SDK integration tests for version stages, tags, policies, rotation.
-      </description>
-
-      <files>
+        <modify>src/secretsmanager/storage.rs</modify>
+        <modify>src/secretsmanager/dispatcher.rs</modify>
+        <modify>src/secretsmanager/types.rs</modify>
         <modify>tests/secretsmanager_integration.rs</modify>
       </files>
 
       <action>
-        Add integration tests:
-        - test_tag_and_untag_resource: add tags, describe → verify, remove tag, describe → verify
-        - test_put_and_get_resource_policy: put JSON policy, get → verify round-trip
-        - test_delete_resource_policy: put, delete, get → null/error
-        - test_rotate_secret: configure rotation, describe → rotation_enabled=true
-        - test_update_version_stage: create, put new value, move custom label, verify
+        1. BatchGetSecretValue:
+           Request: { SecretIdList: [String], MaxResults: i32, NextToken: String }
+           Response: { SecretValues: [...], Errors: [...], NextToken: String }
+
+           SecretValues entry: same as GetSecretValueResponse
+           Errors entry: { SecretId, ErrorCode, Message }
+
+           - For each SecretId in list, try get_secret_value
+           - Successes go in SecretValues, failures go in Errors
+           - Pagination via MaxResults + NextToken (base64 index)
+
+        2. ValidateResourcePolicy:
+           Request: { SecretId: Option, ResourcePolicy: String }
+           Response: { PolicyValidationPassed: bool, ValidationErrors: [...] }
+
+           - Try to parse ResourcePolicy as JSON
+           - If valid JSON: PolicyValidationPassed = true, empty errors
+           - If invalid: PolicyValidationPassed = false, one error with message
+
+        3. Integration tests:
+           - test_batch_get_secret_value: create 3 secrets, batch get → all 3 in SecretValues
+           - test_batch_get_partial_failure: create 1 secret, batch get with 1 real + 1 fake → 1 success + 1 error
+           - test_validate_resource_policy_valid: valid JSON → passed
+           - test_validate_resource_policy_invalid: invalid JSON → not passed with error
       </action>
 
       <verification>
-        <command>cargo test --test secretsmanager_integration</command>
         <command>cargo test</command>
+        <command>cargo clippy -- -D warnings</command>
       </verification>
 
       <done>
-        - All integration tests pass with real AWS SDK
-        - All existing tests still pass
-        - Full LocalStack Community parity for SM
+        - BatchGetSecretValue works with partial failures
+        - ValidateResourcePolicy checks JSON parsability
+        - 4 new integration tests pass
+        - All 221 existing tests pass
+      </done>
+    </task>
+
+    <task id="2" type="setup" complete="false">
+      <name>Update README and CLAUDE.md with Secrets Manager documentation</name>
+      <description>
+        Add Secrets Manager section to README with SDK config examples and
+        supported operations table. Update CLAUDE.md architecture notes.
+      </description>
+
+      <files>
+        <modify>README.md</modify>
+        <modify>CLAUDE.md</modify>
+      </files>
+
+      <action>
+        1. README.md — add "Secrets Manager" section after S3 operations:
+           - SDK config examples showing endpoint_url usage for SM clients
+           - Supported SM operations table (19 operations)
+           - Note that SM uses JSON protocol (not XML like S3)
+
+        2. CLAUDE.md — update the SM section with final operation count and architecture
+      </action>
+
+      <verification>
+        <manual>Review README for completeness and accuracy</manual>
+      </verification>
+
+      <done>
+        - README has SM section with SDK examples and operations table
+        - CLAUDE.md reflects final SM architecture
       </done>
     </task>
   </tasks>
@@ -153,8 +125,8 @@
 
   <completion_criteria>
     <criterion>Both tasks complete</criterion>
-    <criterion>All 8 new operations work via AWS SDK</criterion>
-    <criterion>17 total SM operations implemented</criterion>
-    <criterion>All 216+ tests pass</criterion>
+    <criterion>19 total SM operations</criterion>
+    <criterion>README documents both S3 and Secrets Manager</criterion>
+    <criterion>All tests pass</criterion>
   </completion_criteria>
 </plan>
