@@ -159,5 +159,5 @@ CLI flags take precedence over environment variables.
 
 Planning documents live in `.planning/`:
 - `PROJECT.md` / `ROADMAP.md` / `STATE.md` — S3 service (complete)
-- `PRD-secrets-manager.md` — full product requirements for Secrets Manager
-- `PROJECT-secrets-manager.md` / `ROADMAP-secrets-manager.md` / `STATE-secrets-manager.md` — Secrets Manager planning and progress
+- `PRD-secrets-manager.md` / `PROJECT-secrets-manager.md` / `ROADMAP-secrets-manager.md` / `STATE-secrets-manager.md` — Secrets Manager (complete)
+- `PRD-dynamodb.md` / `PROJECT-dynamodb.md` / `ROADMAP-dynamodb.md` / `STATE-dynamodb.md` — DynamoDB (in progress)
