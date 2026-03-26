@@ -16,6 +16,14 @@ pub struct SecretMetadata {
     pub last_accessed_date: Option<f64>,
     pub deleted_date: Option<f64>,
     pub version_ids_to_stages: HashMap<String, Vec<String>>,
+    #[serde(default)]
+    pub rotation_enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rotation_lambda_arn: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rotation_rules: Option<RotationRulesInput>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_rotated_date: Option<f64>,
 }
 
 /// Stored on disk: a single version of a secret's value.
@@ -316,6 +324,155 @@ pub struct SecretVersionEntry {
     pub version_stages: Vec<String>,
     #[serde(rename = "CreatedDate")]
     pub created_date: f64,
+}
+
+// ---------------------------------------------------------------------------
+// TagResource / UntagResource
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+pub struct TagResourceRequest {
+    #[serde(rename = "SecretId")]
+    pub secret_id: String,
+    #[serde(rename = "Tags")]
+    pub tags: Vec<Tag>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UntagResourceRequest {
+    #[serde(rename = "SecretId")]
+    pub secret_id: String,
+    #[serde(rename = "TagKeys")]
+    pub tag_keys: Vec<String>,
+}
+
+// ---------------------------------------------------------------------------
+// PutResourcePolicy / GetResourcePolicy / DeleteResourcePolicy
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+pub struct PutResourcePolicyRequest {
+    #[serde(rename = "SecretId")]
+    pub secret_id: String,
+    #[serde(rename = "ResourcePolicy")]
+    pub resource_policy: String,
+    #[serde(rename = "BlockPublicPolicy", default)]
+    pub block_public_policy: Option<bool>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PutResourcePolicyResponse {
+    #[serde(rename = "ARN")]
+    pub arn: String,
+    #[serde(rename = "Name")]
+    pub name: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct GetResourcePolicyRequest {
+    #[serde(rename = "SecretId")]
+    pub secret_id: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct GetResourcePolicyResponse {
+    #[serde(rename = "ARN")]
+    pub arn: String,
+    #[serde(rename = "Name")]
+    pub name: String,
+    #[serde(rename = "ResourcePolicy", skip_serializing_if = "Option::is_none")]
+    pub resource_policy: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DeleteResourcePolicyRequest {
+    #[serde(rename = "SecretId")]
+    pub secret_id: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DeleteResourcePolicyResponse {
+    #[serde(rename = "ARN")]
+    pub arn: String,
+    #[serde(rename = "Name")]
+    pub name: String,
+}
+
+// ---------------------------------------------------------------------------
+// RotateSecret / CancelRotateSecret
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RotationRulesInput {
+    #[serde(
+        rename = "AutomaticallyAfterDays",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub automatically_after_days: Option<i64>,
+    #[serde(rename = "Duration", skip_serializing_if = "Option::is_none")]
+    pub duration: Option<String>,
+    #[serde(rename = "ScheduleExpression", skip_serializing_if = "Option::is_none")]
+    pub schedule_expression: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RotateSecretRequest {
+    #[serde(rename = "SecretId")]
+    pub secret_id: String,
+    #[serde(rename = "ClientRequestToken")]
+    pub client_request_token: Option<String>,
+    #[serde(rename = "RotationLambdaARN")]
+    pub rotation_lambda_arn: Option<String>,
+    #[serde(rename = "RotationRules")]
+    pub rotation_rules: Option<RotationRulesInput>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RotateSecretResponse {
+    #[serde(rename = "ARN")]
+    pub arn: String,
+    #[serde(rename = "Name")]
+    pub name: String,
+    #[serde(rename = "VersionId")]
+    pub version_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CancelRotateSecretRequest {
+    #[serde(rename = "SecretId")]
+    pub secret_id: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CancelRotateSecretResponse {
+    #[serde(rename = "ARN")]
+    pub arn: String,
+    #[serde(rename = "Name")]
+    pub name: String,
+}
+
+// ---------------------------------------------------------------------------
+// UpdateSecretVersionStage
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+pub struct UpdateSecretVersionStageRequest {
+    #[serde(rename = "SecretId")]
+    pub secret_id: String,
+    #[serde(rename = "VersionStage")]
+    pub version_stage: String,
+    #[serde(rename = "MoveToVersionId")]
+    pub move_to_version_id: Option<String>,
+    #[serde(rename = "RemoveFromVersionId")]
+    pub remove_from_version_id: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct UpdateSecretVersionStageResponse {
+    #[serde(rename = "ARN")]
+    pub arn: String,
+    #[serde(rename = "Name")]
+    pub name: String,
 }
 
 // ---------------------------------------------------------------------------

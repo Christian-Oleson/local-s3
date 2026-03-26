@@ -795,3 +795,270 @@ async fn test_list_secret_version_ids() {
         "Should have AWSPREVIOUS"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Phase 3 tests
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_tag_and_untag_resource() {
+    let s = TestServer::start().await;
+
+    s.sm_client
+        .create_secret()
+        .name("tag-test")
+        .secret_string("value")
+        .send()
+        .await
+        .unwrap();
+
+    // Tag with 2 tags
+    s.sm_client
+        .tag_resource()
+        .secret_id("tag-test")
+        .tags(
+            aws_sdk_secretsmanager::types::Tag::builder()
+                .key("env")
+                .value("prod")
+                .build(),
+        )
+        .tags(
+            aws_sdk_secretsmanager::types::Tag::builder()
+                .key("team")
+                .value("backend")
+                .build(),
+        )
+        .send()
+        .await
+        .unwrap();
+
+    // Describe -> should have 2 tags
+    let desc = s
+        .sm_client
+        .describe_secret()
+        .secret_id("tag-test")
+        .send()
+        .await
+        .unwrap();
+    let tags = desc.tags();
+    assert_eq!(tags.len(), 2, "Should have 2 tags after tagging");
+
+    // Untag 1 key
+    s.sm_client
+        .untag_resource()
+        .secret_id("tag-test")
+        .tag_keys("env")
+        .send()
+        .await
+        .unwrap();
+
+    // Describe -> should have 1 tag
+    let desc2 = s
+        .sm_client
+        .describe_secret()
+        .secret_id("tag-test")
+        .send()
+        .await
+        .unwrap();
+    let tags2 = desc2.tags();
+    assert_eq!(tags2.len(), 1, "Should have 1 tag after untagging");
+    assert_eq!(tags2[0].key(), Some("team"));
+    assert_eq!(tags2[0].value(), Some("backend"));
+}
+
+#[tokio::test]
+async fn test_put_and_get_resource_policy() {
+    let s = TestServer::start().await;
+
+    s.sm_client
+        .create_secret()
+        .name("policy-test")
+        .secret_string("value")
+        .send()
+        .await
+        .unwrap();
+
+    let policy_json = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"secretsmanager:GetSecretValue","Resource":"*"}]}"#;
+
+    // Put resource policy
+    s.sm_client
+        .put_resource_policy()
+        .secret_id("policy-test")
+        .resource_policy(policy_json)
+        .send()
+        .await
+        .unwrap();
+
+    // Get resource policy
+    let get_resp = s
+        .sm_client
+        .get_resource_policy()
+        .secret_id("policy-test")
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        get_resp.resource_policy(),
+        Some(policy_json),
+        "Resource policy should match what was put"
+    );
+    assert!(get_resp.arn().is_some());
+    assert_eq!(get_resp.name(), Some("policy-test"));
+}
+
+#[tokio::test]
+async fn test_delete_resource_policy() {
+    let s = TestServer::start().await;
+
+    s.sm_client
+        .create_secret()
+        .name("policy-del-test")
+        .secret_string("value")
+        .send()
+        .await
+        .unwrap();
+
+    let policy_json = r#"{"Version":"2012-10-17"}"#;
+
+    // Put a policy
+    s.sm_client
+        .put_resource_policy()
+        .secret_id("policy-del-test")
+        .resource_policy(policy_json)
+        .send()
+        .await
+        .unwrap();
+
+    // Delete the policy
+    s.sm_client
+        .delete_resource_policy()
+        .secret_id("policy-del-test")
+        .send()
+        .await
+        .unwrap();
+
+    // Get should return no policy
+    let get_resp = s
+        .sm_client
+        .get_resource_policy()
+        .secret_id("policy-del-test")
+        .send()
+        .await
+        .unwrap();
+
+    assert!(
+        get_resp.resource_policy().is_none(),
+        "Resource policy should be None after deletion"
+    );
+}
+
+#[tokio::test]
+async fn test_rotate_secret_config() {
+    let s = TestServer::start().await;
+
+    s.sm_client
+        .create_secret()
+        .name("rotate-config-test")
+        .secret_string("initial-value")
+        .send()
+        .await
+        .unwrap();
+
+    // Rotate with lambda ARN and rules
+    let rotate_resp = s
+        .sm_client
+        .rotate_secret()
+        .secret_id("rotate-config-test")
+        .rotation_lambda_arn("arn:aws:lambda:us-east-1:000000000000:function:my-rotation")
+        .rotation_rules(
+            aws_sdk_secretsmanager::types::RotationRulesType::builder()
+                .automatically_after_days(30)
+                .build(),
+        )
+        .send()
+        .await
+        .unwrap();
+
+    assert!(rotate_resp.arn().is_some());
+    assert_eq!(rotate_resp.name(), Some("rotate-config-test"));
+    assert!(
+        rotate_resp.version_id().is_some(),
+        "Should return a version id for the pending version"
+    );
+
+    // Describe -> rotation_enabled should be true
+    let desc = s
+        .sm_client
+        .describe_secret()
+        .secret_id("rotate-config-test")
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        desc.rotation_enabled(),
+        Some(true),
+        "Rotation should be enabled after rotate_secret"
+    );
+}
+
+#[tokio::test]
+async fn test_update_version_stage() {
+    let s = TestServer::start().await;
+
+    // Create secret with initial value
+    let create_resp = s
+        .sm_client
+        .create_secret()
+        .name("stage-test")
+        .secret_string("v1")
+        .send()
+        .await
+        .unwrap();
+    let v1_id = create_resp.version_id().unwrap().to_string();
+
+    // Put a new value -> v2 becomes AWSCURRENT, v1 becomes AWSPREVIOUS
+    let put_resp = s
+        .sm_client
+        .put_secret_value()
+        .secret_id("stage-test")
+        .secret_string("v2")
+        .send()
+        .await
+        .unwrap();
+    let v2_id = put_resp.version_id().unwrap().to_string();
+
+    // Move a custom label "MYLABEL" to v1
+    s.sm_client
+        .update_secret_version_stage()
+        .secret_id("stage-test")
+        .version_stage("MYLABEL")
+        .move_to_version_id(&v1_id)
+        .send()
+        .await
+        .unwrap();
+
+    // Describe -> verify v1 has MYLABEL
+    let desc = s
+        .sm_client
+        .describe_secret()
+        .secret_id("stage-test")
+        .send()
+        .await
+        .unwrap();
+
+    let stages = desc.version_ids_to_stages().unwrap();
+    let v1_stages = stages.get(&v1_id).expect("v1 should have stages");
+    assert!(
+        v1_stages.contains(&"MYLABEL".to_string()),
+        "v1 should have MYLABEL stage, got: {v1_stages:?}"
+    );
+
+    // v2 should still have AWSCURRENT
+    let v2_stages = stages.get(&v2_id).expect("v2 should have stages");
+    assert!(
+        v2_stages.contains(&"AWSCURRENT".to_string()),
+        "v2 should still have AWSCURRENT"
+    );
+}

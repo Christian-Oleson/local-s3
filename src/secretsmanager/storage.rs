@@ -7,12 +7,17 @@ use uuid::Uuid;
 
 use super::error::SmError;
 use super::types::{
-    CreateSecretRequest, CreateSecretResponse, DeleteSecretRequest, DeleteSecretResponse,
-    DescribeSecretRequest, DescribeSecretResponse, GetSecretValueRequest, GetSecretValueResponse,
-    ListSecretVersionIdsRequest, ListSecretVersionIdsResponse, ListSecretsRequest,
-    ListSecretsResponse, PutSecretValueRequest, PutSecretValueResponse, RestoreSecretRequest,
-    RestoreSecretResponse, SecretFilter, SecretListEntry, SecretMetadata, SecretVersion,
-    SecretVersionEntry, UpdateSecretRequest, UpdateSecretResponse,
+    CancelRotateSecretRequest, CancelRotateSecretResponse, CreateSecretRequest,
+    CreateSecretResponse, DeleteResourcePolicyRequest, DeleteResourcePolicyResponse,
+    DeleteSecretRequest, DeleteSecretResponse, DescribeSecretRequest, DescribeSecretResponse,
+    GetResourcePolicyRequest, GetResourcePolicyResponse, GetSecretValueRequest,
+    GetSecretValueResponse, ListSecretVersionIdsRequest, ListSecretVersionIdsResponse,
+    ListSecretsRequest, ListSecretsResponse, PutResourcePolicyRequest, PutResourcePolicyResponse,
+    PutSecretValueRequest, PutSecretValueResponse, RestoreSecretRequest, RestoreSecretResponse,
+    RotateSecretRequest, RotateSecretResponse, SecretFilter, SecretListEntry, SecretMetadata,
+    SecretVersion, SecretVersionEntry, TagResourceRequest, UntagResourceRequest,
+    UpdateSecretRequest, UpdateSecretResponse, UpdateSecretVersionStageRequest,
+    UpdateSecretVersionStageResponse,
 };
 
 pub struct SecretsStorage {
@@ -77,6 +82,10 @@ impl SecretsStorage {
             last_accessed_date: None,
             deleted_date: None,
             version_ids_to_stages,
+            rotation_enabled: false,
+            rotation_lambda_arn: None,
+            rotation_rules: None,
+            last_rotated_date: None,
         };
 
         // Write metadata
@@ -311,7 +320,7 @@ impl SecretsStorage {
             name: metadata.name,
             description: metadata.description,
             kms_key_id: metadata.kms_key_id,
-            rotation_enabled: false,
+            rotation_enabled: metadata.rotation_enabled,
             tags: metadata.tags,
             version_ids_to_stages,
             created_date: metadata.created_date,
@@ -388,7 +397,7 @@ impl SecretsStorage {
                 name: metadata.name,
                 description: metadata.description,
                 kms_key_id: metadata.kms_key_id,
-                rotation_enabled: false,
+                rotation_enabled: metadata.rotation_enabled,
                 tags: metadata.tags,
                 secret_versions_to_stages: version_ids_to_stages,
                 created_date: metadata.created_date,
@@ -534,6 +543,253 @@ impl SecretsStorage {
             name: metadata.name,
             versions,
             next_token,
+        })
+    }
+
+    // -----------------------------------------------------------------------
+    // TagResource / UntagResource
+    // -----------------------------------------------------------------------
+
+    pub async fn tag_resource(&self, req: TagResourceRequest) -> Result<(), SmError> {
+        let mut metadata = self.resolve_secret(&req.secret_id).await?;
+
+        // Merge tags: overwrite on key match, add new ones
+        for new_tag in req.tags {
+            if let Some(existing) = metadata.tags.iter_mut().find(|t| t.key == new_tag.key) {
+                existing.value = new_tag.value;
+            } else {
+                metadata.tags.push(new_tag);
+            }
+        }
+
+        metadata.last_changed_date = epoch_now();
+        self.write_metadata(&metadata).await?;
+        Ok(())
+    }
+
+    pub async fn untag_resource(&self, req: UntagResourceRequest) -> Result<(), SmError> {
+        let mut metadata = self.resolve_secret(&req.secret_id).await?;
+
+        metadata.tags.retain(|t| !req.tag_keys.contains(&t.key));
+
+        metadata.last_changed_date = epoch_now();
+        self.write_metadata(&metadata).await?;
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // PutResourcePolicy / GetResourcePolicy / DeleteResourcePolicy
+    // -----------------------------------------------------------------------
+
+    pub async fn put_resource_policy(
+        &self,
+        req: PutResourcePolicyRequest,
+    ) -> Result<PutResourcePolicyResponse, SmError> {
+        let metadata = self.resolve_secret(&req.secret_id).await?;
+
+        let policy_path = self.secret_dir(&metadata.name).join("policy.json");
+        fs::write(&policy_path, &req.resource_policy)
+            .await
+            .map_err(io_err)?;
+
+        Ok(PutResourcePolicyResponse {
+            arn: metadata.arn,
+            name: metadata.name,
+        })
+    }
+
+    pub async fn get_resource_policy(
+        &self,
+        req: GetResourcePolicyRequest,
+    ) -> Result<GetResourcePolicyResponse, SmError> {
+        let metadata = self.resolve_secret(&req.secret_id).await?;
+
+        let policy_path = self.secret_dir(&metadata.name).join("policy.json");
+        let resource_policy = if policy_path.exists() {
+            Some(fs::read_to_string(&policy_path).await.map_err(io_err)?)
+        } else {
+            None
+        };
+
+        Ok(GetResourcePolicyResponse {
+            arn: metadata.arn,
+            name: metadata.name,
+            resource_policy,
+        })
+    }
+
+    pub async fn delete_resource_policy(
+        &self,
+        req: DeleteResourcePolicyRequest,
+    ) -> Result<DeleteResourcePolicyResponse, SmError> {
+        let metadata = self.resolve_secret(&req.secret_id).await?;
+
+        let policy_path = self.secret_dir(&metadata.name).join("policy.json");
+        if policy_path.exists() {
+            fs::remove_file(&policy_path).await.map_err(io_err)?;
+        }
+
+        Ok(DeleteResourcePolicyResponse {
+            arn: metadata.arn,
+            name: metadata.name,
+        })
+    }
+
+    // -----------------------------------------------------------------------
+    // RotateSecret / CancelRotateSecret
+    // -----------------------------------------------------------------------
+
+    pub async fn rotate_secret(
+        &self,
+        req: RotateSecretRequest,
+    ) -> Result<RotateSecretResponse, SmError> {
+        let mut metadata = self.resolve_secret(&req.secret_id).await?;
+
+        if metadata.deleted_date.is_some() {
+            return Err(SmError::InvalidRequestException {
+                message: "You can't perform this operation on the secret because it was marked for deletion.".to_string(),
+            });
+        }
+
+        let now = epoch_now();
+        let version_id = req
+            .client_request_token
+            .unwrap_or_else(|| Uuid::new_v4().to_string());
+
+        // Update rotation configuration
+        metadata.rotation_enabled = true;
+        if let Some(lambda_arn) = req.rotation_lambda_arn {
+            metadata.rotation_lambda_arn = Some(lambda_arn);
+        }
+        if let Some(rules) = req.rotation_rules {
+            metadata.rotation_rules = Some(rules);
+        }
+        metadata.last_rotated_date = Some(now);
+        metadata.last_changed_date = now;
+
+        // Create a new version with AWSPENDING label
+        let version = SecretVersion {
+            version_id: version_id.clone(),
+            secret_string: None,
+            secret_binary: None,
+            version_stages: vec!["AWSPENDING".to_string()],
+            created_date: now,
+        };
+        self.write_version(&metadata.name, &version).await?;
+
+        // Update metadata version stages
+        metadata
+            .version_ids_to_stages
+            .insert(version_id.clone(), vec!["AWSPENDING".to_string()]);
+        self.write_metadata(&metadata).await?;
+
+        Ok(RotateSecretResponse {
+            arn: metadata.arn,
+            name: metadata.name,
+            version_id,
+        })
+    }
+
+    pub async fn cancel_rotate_secret(
+        &self,
+        req: CancelRotateSecretRequest,
+    ) -> Result<CancelRotateSecretResponse, SmError> {
+        let mut metadata = self.resolve_secret(&req.secret_id).await?;
+
+        metadata.rotation_enabled = false;
+        metadata.last_changed_date = epoch_now();
+
+        // Remove AWSPENDING label from any version that has it
+        let pending_vids: Vec<String> = metadata
+            .version_ids_to_stages
+            .iter()
+            .filter(|(_, stages)| stages.contains(&"AWSPENDING".to_string()))
+            .map(|(vid, _)| vid.clone())
+            .collect();
+
+        for vid in &pending_vids {
+            if let Some(stages) = metadata.version_ids_to_stages.get_mut(vid) {
+                stages.retain(|s| s != "AWSPENDING");
+                if stages.is_empty() {
+                    metadata.version_ids_to_stages.remove(vid);
+                }
+            }
+            // Update the version file on disk
+            if let Ok(mut ver) = self.read_version(&metadata.name, vid).await {
+                ver.version_stages.retain(|s| s != "AWSPENDING");
+                let _ = self.write_version(&metadata.name, &ver).await;
+            }
+        }
+
+        self.write_metadata(&metadata).await?;
+
+        Ok(CancelRotateSecretResponse {
+            arn: metadata.arn,
+            name: metadata.name,
+        })
+    }
+
+    // -----------------------------------------------------------------------
+    // UpdateSecretVersionStage
+    // -----------------------------------------------------------------------
+
+    pub async fn update_secret_version_stage(
+        &self,
+        req: UpdateSecretVersionStageRequest,
+    ) -> Result<UpdateSecretVersionStageResponse, SmError> {
+        let mut metadata = self.resolve_secret(&req.secret_id).await?;
+
+        if metadata.deleted_date.is_some() {
+            return Err(SmError::InvalidRequestException {
+                message: "You can't perform this operation on the secret because it was marked for deletion.".to_string(),
+            });
+        }
+
+        let now = epoch_now();
+
+        // Remove the stage from the source version
+        if let Some(ref remove_vid) = req.remove_from_version_id {
+            if let Some(stages) = metadata.version_ids_to_stages.get_mut(remove_vid) {
+                stages.retain(|s| s != &req.version_stage);
+                if stages.is_empty() {
+                    metadata.version_ids_to_stages.remove(remove_vid);
+                }
+            }
+            // Update the version file on disk
+            if let Ok(mut ver) = self.read_version(&metadata.name, remove_vid).await {
+                ver.version_stages.retain(|s| s != &req.version_stage);
+                let _ = self.write_version(&metadata.name, &ver).await;
+            }
+        }
+
+        // Add the stage to the target version
+        if let Some(ref move_vid) = req.move_to_version_id {
+            // Verify the version exists on disk
+            let _ver = self.read_version(&metadata.name, move_vid).await?;
+
+            let stages = metadata
+                .version_ids_to_stages
+                .entry(move_vid.clone())
+                .or_default();
+            if !stages.contains(&req.version_stage) {
+                stages.push(req.version_stage.clone());
+            }
+
+            // Update the version file on disk
+            if let Ok(mut ver) = self.read_version(&metadata.name, move_vid).await {
+                if !ver.version_stages.contains(&req.version_stage) {
+                    ver.version_stages.push(req.version_stage.clone());
+                }
+                let _ = self.write_version(&metadata.name, &ver).await;
+            }
+        }
+
+        metadata.last_changed_date = now;
+        self.write_metadata(&metadata).await?;
+
+        Ok(UpdateSecretVersionStageResponse {
+            arn: metadata.arn,
+            name: metadata.name,
         })
     }
 

@@ -5,9 +5,11 @@ use axum::response::{IntoResponse, Response};
 use super::error::SmError;
 use super::storage::SecretsStorage;
 use super::types::{
-    CreateSecretRequest, DeleteSecretRequest, DescribeSecretRequest, GetSecretValueRequest,
-    ListSecretVersionIdsRequest, ListSecretsRequest, PutSecretValueRequest, RestoreSecretRequest,
-    UpdateSecretRequest,
+    CancelRotateSecretRequest, CreateSecretRequest, DeleteResourcePolicyRequest,
+    DeleteSecretRequest, DescribeSecretRequest, GetResourcePolicyRequest, GetSecretValueRequest,
+    ListSecretVersionIdsRequest, ListSecretsRequest, PutResourcePolicyRequest,
+    PutSecretValueRequest, RestoreSecretRequest, RotateSecretRequest, TagResourceRequest,
+    UntagResourceRequest, UpdateSecretRequest, UpdateSecretVersionStageRequest,
 };
 
 /// Dispatch an AWS Secrets Manager operation based on the X-Amz-Target header value.
@@ -22,6 +24,14 @@ pub async fn dispatch(storage: &SecretsStorage, operation: &str, body: Bytes) ->
         "ListSecrets" => handle_list_secrets(storage, body).await,
         "UpdateSecret" => handle_update_secret(storage, body).await,
         "ListSecretVersionIds" => handle_list_secret_version_ids(storage, body).await,
+        "TagResource" => handle_tag_resource(storage, body).await,
+        "UntagResource" => handle_untag_resource(storage, body).await,
+        "PutResourcePolicy" => handle_put_resource_policy(storage, body).await,
+        "GetResourcePolicy" => handle_get_resource_policy(storage, body).await,
+        "DeleteResourcePolicy" => handle_delete_resource_policy(storage, body).await,
+        "RotateSecret" => handle_rotate_secret(storage, body).await,
+        "CancelRotateSecret" => handle_cancel_rotate_secret(storage, body).await,
+        "UpdateSecretVersionStage" => handle_update_secret_version_stage(storage, body).await,
         _ => SmError::InvalidParameterException {
             message: format!("Unknown operation: {operation}"),
         }
@@ -123,6 +133,94 @@ async fn handle_list_secret_version_ids(storage: &SecretsStorage, body: Bytes) -
         Err(resp) => return *resp,
     };
     match storage.list_secret_version_ids(req).await {
+        Ok(resp) => json_response(StatusCode::OK, &resp),
+        Err(e) => e.into_response(),
+    }
+}
+
+async fn handle_tag_resource(storage: &SecretsStorage, body: Bytes) -> Response {
+    let req: TagResourceRequest = match parse_json(&body) {
+        Ok(r) => r,
+        Err(resp) => return *resp,
+    };
+    match storage.tag_resource(req).await {
+        Ok(()) => json_response(StatusCode::OK, &serde_json::json!({})),
+        Err(e) => e.into_response(),
+    }
+}
+
+async fn handle_untag_resource(storage: &SecretsStorage, body: Bytes) -> Response {
+    let req: UntagResourceRequest = match parse_json(&body) {
+        Ok(r) => r,
+        Err(resp) => return *resp,
+    };
+    match storage.untag_resource(req).await {
+        Ok(()) => json_response(StatusCode::OK, &serde_json::json!({})),
+        Err(e) => e.into_response(),
+    }
+}
+
+async fn handle_put_resource_policy(storage: &SecretsStorage, body: Bytes) -> Response {
+    let req: PutResourcePolicyRequest = match parse_json(&body) {
+        Ok(r) => r,
+        Err(resp) => return *resp,
+    };
+    match storage.put_resource_policy(req).await {
+        Ok(resp) => json_response(StatusCode::OK, &resp),
+        Err(e) => e.into_response(),
+    }
+}
+
+async fn handle_get_resource_policy(storage: &SecretsStorage, body: Bytes) -> Response {
+    let req: GetResourcePolicyRequest = match parse_json(&body) {
+        Ok(r) => r,
+        Err(resp) => return *resp,
+    };
+    match storage.get_resource_policy(req).await {
+        Ok(resp) => json_response(StatusCode::OK, &resp),
+        Err(e) => e.into_response(),
+    }
+}
+
+async fn handle_delete_resource_policy(storage: &SecretsStorage, body: Bytes) -> Response {
+    let req: DeleteResourcePolicyRequest = match parse_json(&body) {
+        Ok(r) => r,
+        Err(resp) => return *resp,
+    };
+    match storage.delete_resource_policy(req).await {
+        Ok(resp) => json_response(StatusCode::OK, &resp),
+        Err(e) => e.into_response(),
+    }
+}
+
+async fn handle_rotate_secret(storage: &SecretsStorage, body: Bytes) -> Response {
+    let req: RotateSecretRequest = match parse_json(&body) {
+        Ok(r) => r,
+        Err(resp) => return *resp,
+    };
+    match storage.rotate_secret(req).await {
+        Ok(resp) => json_response(StatusCode::OK, &resp),
+        Err(e) => e.into_response(),
+    }
+}
+
+async fn handle_cancel_rotate_secret(storage: &SecretsStorage, body: Bytes) -> Response {
+    let req: CancelRotateSecretRequest = match parse_json(&body) {
+        Ok(r) => r,
+        Err(resp) => return *resp,
+    };
+    match storage.cancel_rotate_secret(req).await {
+        Ok(resp) => json_response(StatusCode::OK, &resp),
+        Err(e) => e.into_response(),
+    }
+}
+
+async fn handle_update_secret_version_stage(storage: &SecretsStorage, body: Bytes) -> Response {
+    let req: UpdateSecretVersionStageRequest = match parse_json(&body) {
+        Ok(r) => r,
+        Err(resp) => return *resp,
+    };
+    match storage.update_secret_version_stage(req).await {
         Ok(resp) => json_response(StatusCode::OK, &resp),
         Err(e) => e.into_response(),
     }
