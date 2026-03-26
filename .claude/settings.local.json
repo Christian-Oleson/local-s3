@@ -2,7 +2,17 @@
   "permissions": {
     "allow": [
       "Bash(git add:*)",
-      "Bash(git commit:*)"
+      "Bash(git commit:*)",
+      "Bash(docker build:*)",
+      "Bash(rustc:*)",
+      "Bash(curl -s http://localhost:4566/_health)",
+      "Bash(curl -s http://localhost:4566/)",
+      "Bash(curl -s -X PUT http://localhost:4566/my-bucket)",
+      "Bash(curl -s -X PUT -d \"Hello from Docker!\" -H \"Content-Type: text/plain\" http://localhost:4566/my-bucket/hello.txt)",
+      "Bash(curl -s http://localhost:4566/my-bucket/hello.txt)",
+      "Bash(docker stop:*)",
+      "Bash(docker rm:*)",
+      "Bash(wc:*)"
     ]
   }
 }

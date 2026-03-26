@@ -11,6 +11,7 @@ use aws_sdk_s3::types::CompletedMultipartUpload;
 use aws_sdk_s3::types::CompletedPart;
 use tempfile::TempDir;
 
+use local_s3::secretsmanager::storage::SecretsStorage;
 use local_s3::server::{AppState, build_router};
 use local_s3::storage::FileSystemStorage;
 
@@ -25,9 +26,13 @@ impl TestServer {
         let storage = FileSystemStorage::new(tmp_dir.path().to_path_buf())
             .await
             .expect("Failed to create storage");
+        let secrets_storage = SecretsStorage::new(tmp_dir.path().to_path_buf())
+            .await
+            .expect("Failed to create secrets storage");
 
         let state = AppState {
             storage: Arc::new(storage),
+            secrets_storage: Arc::new(secrets_storage),
         };
 
         let app = build_router(state);

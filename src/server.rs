@@ -2,6 +2,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::Router;
+use axum::body::Bytes;
 use axum::extract::{Path, Request, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::middleware;
@@ -12,11 +13,14 @@ use tokio::net::TcpListener;
 use crate::middleware::s3_headers_middleware;
 use crate::routes::bucket;
 use crate::routes::object;
+use crate::secretsmanager;
+use crate::secretsmanager::storage::SecretsStorage;
 use crate::storage::FileSystemStorage;
 
 #[derive(Clone)]
 pub struct AppState {
     pub storage: Arc<FileSystemStorage>,
+    pub secrets_storage: Arc<SecretsStorage>,
 }
 
 async fn fallback(req: Request) -> impl IntoResponse {
@@ -102,6 +106,22 @@ async fn health_handler() -> impl IntoResponse {
     (StatusCode::OK, "healthy")
 }
 
+/// Handle POST / — dispatches to Secrets Manager if X-Amz-Target header is present,
+/// otherwise returns Method Not Allowed (S3 list_buckets only supports GET on /).
+async fn secretsmanager_post_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if let Some(target) = headers.get("x-amz-target").and_then(|v| v.to_str().ok())
+        && let Some(operation) = target.strip_prefix("secretsmanager.")
+    {
+        return secretsmanager::dispatcher::dispatch(&state.secrets_storage, operation, body).await;
+    }
+    // Not a Secrets Manager request — POST on / is not a valid S3 operation
+    (StatusCode::METHOD_NOT_ALLOWED, "Method Not Allowed").into_response()
+}
+
 pub fn build_router(state: AppState) -> Router {
     let bucket_methods = put(bucket::create_bucket)
         .delete(bucket::delete_bucket)
@@ -112,7 +132,10 @@ pub fn build_router(state: AppState) -> Router {
 
     Router::new()
         .route("/_health", get(health_handler))
-        .route("/", get(bucket::list_buckets))
+        .route(
+            "/",
+            get(bucket::list_buckets).post(secretsmanager_post_handler),
+        )
         .route("/{bucket_name}", bucket_methods.clone())
         .route("/{bucket_name}/", bucket_methods)
         .route(
@@ -130,15 +153,20 @@ pub fn build_router(state: AppState) -> Router {
 }
 
 pub async fn run_server(port: u16, data_dir: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
-    let storage =
-        FileSystemStorage::new(data_dir)
+    let storage = FileSystemStorage::new(data_dir.clone()).await.map_err(
+        |e| -> Box<dyn std::error::Error> { format!("Failed to initialize storage: {e}").into() },
+    )?;
+
+    let secrets_storage =
+        SecretsStorage::new(data_dir)
             .await
             .map_err(|e| -> Box<dyn std::error::Error> {
-                format!("Failed to initialize storage: {e}").into()
+                format!("Failed to initialize secrets storage: {e}").into()
             })?;
 
     let state = AppState {
         storage: Arc::new(storage),
+        secrets_storage: Arc::new(secrets_storage),
     };
 
     let app = build_router(state);
