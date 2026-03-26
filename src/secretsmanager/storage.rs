@@ -8,8 +8,11 @@ use uuid::Uuid;
 use super::error::SmError;
 use super::types::{
     CreateSecretRequest, CreateSecretResponse, DeleteSecretRequest, DeleteSecretResponse,
-    GetSecretValueRequest, GetSecretValueResponse, PutSecretValueRequest, PutSecretValueResponse,
-    RestoreSecretRequest, RestoreSecretResponse, SecretMetadata, SecretVersion,
+    DescribeSecretRequest, DescribeSecretResponse, GetSecretValueRequest, GetSecretValueResponse,
+    ListSecretVersionIdsRequest, ListSecretVersionIdsResponse, ListSecretsRequest,
+    ListSecretsResponse, PutSecretValueRequest, PutSecretValueResponse, RestoreSecretRequest,
+    RestoreSecretResponse, SecretFilter, SecretListEntry, SecretMetadata, SecretVersion,
+    SecretVersionEntry, UpdateSecretRequest, UpdateSecretResponse,
 };
 
 pub struct SecretsStorage {
@@ -294,6 +297,246 @@ impl SecretsStorage {
         })
     }
 
+    pub async fn describe_secret(
+        &self,
+        req: DescribeSecretRequest,
+    ) -> Result<DescribeSecretResponse, SmError> {
+        let metadata = self.resolve_secret(&req.secret_id).await?;
+
+        // Build VersionIdsToStages from version files on disk
+        let version_ids_to_stages = self.build_version_ids_to_stages(&metadata.name).await?;
+
+        Ok(DescribeSecretResponse {
+            arn: metadata.arn,
+            name: metadata.name,
+            description: metadata.description,
+            kms_key_id: metadata.kms_key_id,
+            rotation_enabled: false,
+            tags: metadata.tags,
+            version_ids_to_stages,
+            created_date: metadata.created_date,
+            last_changed_date: metadata.last_changed_date,
+            last_accessed_date: metadata.last_accessed_date,
+            deleted_date: metadata.deleted_date,
+        })
+    }
+
+    pub async fn list_secrets(
+        &self,
+        req: ListSecretsRequest,
+    ) -> Result<ListSecretsResponse, SmError> {
+        let max_results = req.max_results.unwrap_or(100).min(100);
+        let include_planned_deletion = req.include_planned_deletion.unwrap_or(false);
+        let filters = req.filters.unwrap_or_default();
+
+        // Decode the pagination token (base64-encoded secret name to start after)
+        let start_after = req
+            .next_token
+            .as_deref()
+            .and_then(super::types::decode_next_token);
+
+        // Scan all secret directories
+        let secrets_dir = self.root_dir.join("secrets");
+        let mut entries = Vec::new();
+
+        if let Ok(mut dir) = fs::read_dir(&secrets_dir).await {
+            while let Ok(Some(entry)) = dir.next_entry().await {
+                let meta_path = entry.path().join("metadata.json");
+                if !meta_path.exists() {
+                    continue;
+                }
+                if let Ok(metadata) = self.read_metadata_from_path(&meta_path).await {
+                    // Exclude deleted secrets unless include_planned_deletion
+                    if metadata.deleted_date.is_some() && !include_planned_deletion {
+                        continue;
+                    }
+                    // Apply filters
+                    if !Self::matches_filters(&metadata, &filters) {
+                        continue;
+                    }
+                    entries.push(metadata);
+                }
+            }
+        }
+
+        // Sort by name ascending
+        entries.sort_by(|a, b| a.name.cmp(&b.name));
+
+        // Apply pagination: skip entries until we pass start_after
+        if let Some(ref after) = start_after {
+            entries.retain(|m| m.name.as_str() > after.as_str());
+        }
+
+        // Take max_results + 1 to detect if there's a next page
+        let has_more = entries.len() > max_results;
+        entries.truncate(max_results);
+
+        let next_token = if has_more {
+            entries
+                .last()
+                .map(|m| super::types::encode_next_token(&m.name))
+        } else {
+            None
+        };
+
+        // Build the response list
+        let mut secret_list = Vec::with_capacity(entries.len());
+        for metadata in entries {
+            let version_ids_to_stages = self.build_version_ids_to_stages(&metadata.name).await?;
+            secret_list.push(SecretListEntry {
+                arn: metadata.arn,
+                name: metadata.name,
+                description: metadata.description,
+                kms_key_id: metadata.kms_key_id,
+                rotation_enabled: false,
+                tags: metadata.tags,
+                secret_versions_to_stages: version_ids_to_stages,
+                created_date: metadata.created_date,
+                last_changed_date: metadata.last_changed_date,
+                last_accessed_date: metadata.last_accessed_date,
+                deleted_date: metadata.deleted_date,
+            });
+        }
+
+        Ok(ListSecretsResponse {
+            secret_list,
+            next_token,
+        })
+    }
+
+    pub async fn update_secret(
+        &self,
+        req: UpdateSecretRequest,
+    ) -> Result<UpdateSecretResponse, SmError> {
+        let mut metadata = self.resolve_secret(&req.secret_id).await?;
+
+        if metadata.deleted_date.is_some() {
+            return Err(SmError::InvalidRequestException {
+                message: "You can't perform this operation on the secret because it was marked for deletion.".to_string(),
+            });
+        }
+
+        let now = epoch_now();
+
+        // Update metadata fields if provided
+        if let Some(ref desc) = req.description {
+            metadata.description = Some(desc.clone());
+            metadata.last_changed_date = now;
+        }
+        if let Some(ref kms) = req.kms_key_id {
+            metadata.kms_key_id = Some(kms.clone());
+            metadata.last_changed_date = now;
+        }
+
+        // If secret value is provided, create a new version via put_secret_value logic
+        let version_id = if req.secret_string.is_some() || req.secret_binary.is_some() {
+            // Write updated metadata first (description/kms changes)
+            self.write_metadata(&metadata).await?;
+
+            let put_req = PutSecretValueRequest {
+                secret_id: metadata.name.clone(),
+                secret_string: req.secret_string,
+                secret_binary: req.secret_binary,
+                client_request_token: req.client_request_token,
+                version_stages: None,
+            };
+            let put_resp = self.put_secret_value(put_req).await?;
+            Some(put_resp.version_id)
+        } else {
+            // No new value -- just persist metadata changes
+            self.write_metadata(&metadata).await?;
+            None
+        };
+
+        Ok(UpdateSecretResponse {
+            arn: metadata.arn,
+            name: metadata.name,
+            version_id,
+        })
+    }
+
+    pub async fn list_secret_version_ids(
+        &self,
+        req: ListSecretVersionIdsRequest,
+    ) -> Result<ListSecretVersionIdsResponse, SmError> {
+        let metadata = self.resolve_secret(&req.secret_id).await?;
+
+        if metadata.deleted_date.is_some() {
+            return Err(SmError::InvalidRequestException {
+                message: "You can't perform this operation on the secret because it was marked for deletion.".to_string(),
+            });
+        }
+
+        let max_results = req.max_results.unwrap_or(100).min(100);
+        let include_deprecated = req.include_deprecated.unwrap_or(false);
+
+        // Read all version files
+        let versions_dir = self.secret_dir(&metadata.name).join("versions");
+        let mut versions = Vec::new();
+
+        if let Ok(mut dir) = fs::read_dir(&versions_dir).await {
+            while let Ok(Some(entry)) = dir.next_entry().await {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                    continue;
+                }
+                let data = fs::read_to_string(&path).await.map_err(io_err)?;
+                let ver: SecretVersion =
+                    serde_json::from_str(&data).map_err(|e| SmError::InternalServiceError {
+                        message: format!("Failed to deserialize version: {e}"),
+                    })?;
+
+                // Filter deprecated (no staging labels) unless include_deprecated
+                if !include_deprecated && ver.version_stages.is_empty() {
+                    continue;
+                }
+
+                versions.push(SecretVersionEntry {
+                    version_id: ver.version_id,
+                    version_stages: ver.version_stages,
+                    created_date: ver.created_date,
+                });
+            }
+        }
+
+        // Sort by created_date descending
+        versions.sort_by(|a, b| {
+            b.created_date
+                .partial_cmp(&a.created_date)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        // Pagination
+        let start_after = req
+            .next_token
+            .as_deref()
+            .and_then(super::types::decode_next_token);
+
+        if let Some(ref after) = start_after
+            && let Some(pos) = versions.iter().position(|v| v.version_id == *after)
+        {
+            versions = versions.split_off(pos + 1);
+        }
+
+        let has_more = versions.len() > max_results;
+        versions.truncate(max_results);
+
+        let next_token = if has_more {
+            versions
+                .last()
+                .map(|v| super::types::encode_next_token(&v.version_id))
+        } else {
+            None
+        };
+
+        Ok(ListSecretVersionIdsResponse {
+            arn: metadata.arn,
+            name: metadata.name,
+            versions,
+            next_token,
+        })
+    }
+
     // -----------------------------------------------------------------------
     // Internal helpers
     // -----------------------------------------------------------------------
@@ -352,6 +595,76 @@ impl SecretsStorage {
             }
         }
         None
+    }
+
+    /// Check whether a secret's metadata matches all of the given filters.
+    fn matches_filters(metadata: &SecretMetadata, filters: &[SecretFilter]) -> bool {
+        for filter in filters {
+            let matched = match filter.key.as_str() {
+                "name" => filter
+                    .values
+                    .iter()
+                    .any(|v| metadata.name.contains(v.as_str())),
+                "description" => filter.values.iter().any(|v| {
+                    metadata
+                        .description
+                        .as_ref()
+                        .is_some_and(|d| d.contains(v.as_str()))
+                }),
+                "tag-key" => filter
+                    .values
+                    .iter()
+                    .any(|v| metadata.tags.iter().any(|t| t.key == *v)),
+                "tag-value" => filter
+                    .values
+                    .iter()
+                    .any(|v| metadata.tags.iter().any(|t| t.value == *v)),
+                "all" => filter.values.iter().any(|v| {
+                    metadata.name.contains(v.as_str())
+                        || metadata
+                            .description
+                            .as_ref()
+                            .is_some_and(|d| d.contains(v.as_str()))
+                        || metadata
+                            .tags
+                            .iter()
+                            .any(|t| t.key.contains(v.as_str()) || t.value.contains(v.as_str()))
+                }),
+                _ => true, // Unknown filter key — ignore
+            };
+            if !matched {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Read all version files for a secret and build VersionId -> [stages] map.
+    async fn build_version_ids_to_stages(
+        &self,
+        name: &str,
+    ) -> Result<HashMap<String, Vec<String>>, SmError> {
+        let versions_dir = self.secret_dir(name).join("versions");
+        let mut map: HashMap<String, Vec<String>> = HashMap::new();
+
+        if let Ok(mut dir) = fs::read_dir(&versions_dir).await {
+            while let Ok(Some(entry)) = dir.next_entry().await {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                    continue;
+                }
+                let data = fs::read_to_string(&path).await.map_err(io_err)?;
+                let ver: SecretVersion =
+                    serde_json::from_str(&data).map_err(|e| SmError::InternalServiceError {
+                        message: format!("Failed to deserialize version: {e}"),
+                    })?;
+                if !ver.version_stages.is_empty() {
+                    map.insert(ver.version_id, ver.version_stages);
+                }
+            }
+        }
+
+        Ok(map)
     }
 
     fn generate_arn(&self, name: &str) -> String {

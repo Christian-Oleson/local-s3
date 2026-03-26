@@ -418,3 +418,380 @@ async fn test_create_secret_with_binary() {
         .expect("SecretBinary should be present");
     assert_eq!(returned_binary.as_ref(), b"hello binary");
 }
+
+// ---------------------------------------------------------------------------
+// Phase 2 tests
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_describe_secret() {
+    let s = TestServer::start().await;
+
+    let create_result = s
+        .sm_client
+        .create_secret()
+        .name("describe-me")
+        .description("A described secret")
+        .secret_string("my-value")
+        .tags(
+            aws_sdk_secretsmanager::types::Tag::builder()
+                .key("env")
+                .value("test")
+                .build(),
+        )
+        .send()
+        .await
+        .unwrap();
+
+    let desc = s
+        .sm_client
+        .describe_secret()
+        .secret_id("describe-me")
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(desc.name(), Some("describe-me"));
+    assert_eq!(desc.arn(), create_result.arn());
+    assert_eq!(desc.description(), Some("A described secret"));
+
+    let tags = desc.tags();
+    assert_eq!(tags.len(), 1);
+    assert_eq!(tags[0].key(), Some("env"));
+    assert_eq!(tags[0].value(), Some("test"));
+
+    // VersionIdsToStages should have AWSCURRENT
+    let stages = desc.version_ids_to_stages().unwrap();
+    assert_eq!(stages.len(), 1);
+    let (_, stage_list) = stages.iter().next().unwrap();
+    assert!(stage_list.contains(&"AWSCURRENT".to_string()));
+}
+
+#[tokio::test]
+async fn test_describe_secret_version_stages() {
+    let s = TestServer::start().await;
+
+    s.sm_client
+        .create_secret()
+        .name("describe-versions")
+        .secret_string("v1")
+        .send()
+        .await
+        .unwrap();
+
+    // Put a new value so v1 becomes AWSPREVIOUS
+    s.sm_client
+        .put_secret_value()
+        .secret_id("describe-versions")
+        .secret_string("v2")
+        .send()
+        .await
+        .unwrap();
+
+    let desc = s
+        .sm_client
+        .describe_secret()
+        .secret_id("describe-versions")
+        .send()
+        .await
+        .unwrap();
+
+    let stages = desc.version_ids_to_stages().unwrap();
+    assert_eq!(stages.len(), 2, "Should have 2 version entries");
+
+    // Collect all stage labels
+    let mut all_stages: Vec<String> = stages.values().flat_map(|v| v.iter().cloned()).collect();
+    all_stages.sort();
+    assert!(all_stages.contains(&"AWSCURRENT".to_string()));
+    assert!(all_stages.contains(&"AWSPREVIOUS".to_string()));
+}
+
+#[tokio::test]
+async fn test_list_secrets() {
+    let s = TestServer::start().await;
+
+    for name in &["list-alpha", "list-beta", "list-gamma"] {
+        s.sm_client
+            .create_secret()
+            .name(*name)
+            .secret_string("value")
+            .send()
+            .await
+            .unwrap();
+    }
+
+    let result = s.sm_client.list_secrets().send().await.unwrap();
+
+    let names: Vec<&str> = result
+        .secret_list()
+        .iter()
+        .filter_map(|e| e.name())
+        .collect();
+    assert!(names.contains(&"list-alpha"));
+    assert!(names.contains(&"list-beta"));
+    assert!(names.contains(&"list-gamma"));
+    assert_eq!(names.len(), 3);
+}
+
+#[tokio::test]
+async fn test_list_secrets_pagination() {
+    let s = TestServer::start().await;
+
+    for i in 1..=5 {
+        s.sm_client
+            .create_secret()
+            .name(format!("page-secret-{i:02}"))
+            .secret_string(format!("value-{i}"))
+            .send()
+            .await
+            .unwrap();
+    }
+
+    // First page: max_results=2
+    let page1 = s
+        .sm_client
+        .list_secrets()
+        .max_results(2)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(page1.secret_list().len(), 2);
+    let token1 = page1.next_token().expect("Should have next token");
+
+    // Second page
+    let page2 = s
+        .sm_client
+        .list_secrets()
+        .max_results(2)
+        .next_token(token1)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(page2.secret_list().len(), 2);
+    let token2 = page2.next_token().expect("Should have next token");
+
+    // Third page (last one, 1 remaining)
+    let page3 = s
+        .sm_client
+        .list_secrets()
+        .max_results(2)
+        .next_token(token2)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(page3.secret_list().len(), 1);
+    assert!(page3.next_token().is_none(), "No more pages");
+
+    // Verify all 5 unique names were returned
+    let mut all_names: Vec<String> = Vec::new();
+    for page in [&page1, &page2, &page3] {
+        for entry in page.secret_list() {
+            all_names.push(entry.name().unwrap().to_string());
+        }
+    }
+    all_names.sort();
+    assert_eq!(all_names.len(), 5);
+    for i in 1..=5 {
+        assert!(all_names.contains(&format!("page-secret-{i:02}")));
+    }
+}
+
+#[tokio::test]
+async fn test_list_secrets_filter_by_name() {
+    let s = TestServer::start().await;
+
+    s.sm_client
+        .create_secret()
+        .name("alpha-secret")
+        .secret_string("a")
+        .send()
+        .await
+        .unwrap();
+    s.sm_client
+        .create_secret()
+        .name("beta-secret")
+        .secret_string("b")
+        .send()
+        .await
+        .unwrap();
+    s.sm_client
+        .create_secret()
+        .name("gamma-test")
+        .secret_string("c")
+        .send()
+        .await
+        .unwrap();
+
+    let result = s
+        .sm_client
+        .list_secrets()
+        .filters(
+            aws_sdk_secretsmanager::types::Filter::builder()
+                .key(aws_sdk_secretsmanager::types::FilterNameStringType::Name)
+                .values("secret")
+                .build(),
+        )
+        .send()
+        .await
+        .unwrap();
+
+    let names: Vec<&str> = result
+        .secret_list()
+        .iter()
+        .filter_map(|e| e.name())
+        .collect();
+    assert_eq!(names.len(), 2, "Only secrets with 'secret' in name");
+    assert!(names.contains(&"alpha-secret"));
+    assert!(names.contains(&"beta-secret"));
+}
+
+#[tokio::test]
+async fn test_update_secret_description() {
+    let s = TestServer::start().await;
+
+    s.sm_client
+        .create_secret()
+        .name("update-desc")
+        .description("old description")
+        .secret_string("original")
+        .send()
+        .await
+        .unwrap();
+
+    let update_result = s
+        .sm_client
+        .update_secret()
+        .secret_id("update-desc")
+        .description("new description")
+        .send()
+        .await
+        .unwrap();
+
+    // VersionId should be None since no value was changed
+    assert!(
+        update_result.version_id().is_none(),
+        "No new version should be created for metadata-only update"
+    );
+
+    // Describe to verify new description
+    let desc = s
+        .sm_client
+        .describe_secret()
+        .secret_id("update-desc")
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(desc.description(), Some("new description"));
+
+    // Original value should still be accessible
+    let get_result = s
+        .sm_client
+        .get_secret_value()
+        .secret_id("update-desc")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(get_result.secret_string(), Some("original"));
+}
+
+#[tokio::test]
+async fn test_update_secret_value() {
+    let s = TestServer::start().await;
+
+    s.sm_client
+        .create_secret()
+        .name("update-val")
+        .secret_string("old-value")
+        .send()
+        .await
+        .unwrap();
+
+    let update_result = s
+        .sm_client
+        .update_secret()
+        .secret_id("update-val")
+        .secret_string("new-value")
+        .send()
+        .await
+        .unwrap();
+
+    assert!(
+        update_result.version_id().is_some(),
+        "Should have a new version id"
+    );
+
+    let get_result = s
+        .sm_client
+        .get_secret_value()
+        .secret_id("update-val")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(get_result.secret_string(), Some("new-value"));
+}
+
+#[tokio::test]
+async fn test_list_secret_version_ids() {
+    let s = TestServer::start().await;
+
+    s.sm_client
+        .create_secret()
+        .name("versions-test")
+        .secret_string("v1")
+        .send()
+        .await
+        .unwrap();
+
+    s.sm_client
+        .put_secret_value()
+        .secret_id("versions-test")
+        .secret_string("v2")
+        .send()
+        .await
+        .unwrap();
+
+    s.sm_client
+        .put_secret_value()
+        .secret_id("versions-test")
+        .secret_string("v3")
+        .send()
+        .await
+        .unwrap();
+
+    let result = s
+        .sm_client
+        .list_secret_version_ids()
+        .secret_id("versions-test")
+        .include_deprecated(true)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(result.name(), Some("versions-test"));
+    assert!(result.arn().is_some());
+
+    let versions = result.versions();
+    assert_eq!(
+        versions.len(),
+        3,
+        "Should have 3 versions (include deprecated)"
+    );
+
+    // Verify at least one has AWSCURRENT and one has AWSPREVIOUS
+    let all_stages: Vec<String> = versions
+        .iter()
+        .flat_map(|v| v.version_stages().iter().map(|s| s.to_string()))
+        .collect();
+    assert!(
+        all_stages.contains(&"AWSCURRENT".to_string()),
+        "Should have AWSCURRENT"
+    );
+    assert!(
+        all_stages.contains(&"AWSPREVIOUS".to_string()),
+        "Should have AWSPREVIOUS"
+    );
+}

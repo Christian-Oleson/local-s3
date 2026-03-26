@@ -5,8 +5,9 @@ use axum::response::{IntoResponse, Response};
 use super::error::SmError;
 use super::storage::SecretsStorage;
 use super::types::{
-    CreateSecretRequest, DeleteSecretRequest, GetSecretValueRequest, PutSecretValueRequest,
-    RestoreSecretRequest,
+    CreateSecretRequest, DeleteSecretRequest, DescribeSecretRequest, GetSecretValueRequest,
+    ListSecretVersionIdsRequest, ListSecretsRequest, PutSecretValueRequest, RestoreSecretRequest,
+    UpdateSecretRequest,
 };
 
 /// Dispatch an AWS Secrets Manager operation based on the X-Amz-Target header value.
@@ -17,6 +18,10 @@ pub async fn dispatch(storage: &SecretsStorage, operation: &str, body: Bytes) ->
         "PutSecretValue" => handle_put_secret_value(storage, body).await,
         "DeleteSecret" => handle_delete_secret(storage, body).await,
         "RestoreSecret" => handle_restore_secret(storage, body).await,
+        "DescribeSecret" => handle_describe_secret(storage, body).await,
+        "ListSecrets" => handle_list_secrets(storage, body).await,
+        "UpdateSecret" => handle_update_secret(storage, body).await,
+        "ListSecretVersionIds" => handle_list_secret_version_ids(storage, body).await,
         _ => SmError::InvalidParameterException {
             message: format!("Unknown operation: {operation}"),
         }
@@ -74,6 +79,50 @@ async fn handle_restore_secret(storage: &SecretsStorage, body: Bytes) -> Respons
         Err(resp) => return *resp,
     };
     match storage.restore_secret(req).await {
+        Ok(resp) => json_response(StatusCode::OK, &resp),
+        Err(e) => e.into_response(),
+    }
+}
+
+async fn handle_describe_secret(storage: &SecretsStorage, body: Bytes) -> Response {
+    let req: DescribeSecretRequest = match parse_json(&body) {
+        Ok(r) => r,
+        Err(resp) => return *resp,
+    };
+    match storage.describe_secret(req).await {
+        Ok(resp) => json_response(StatusCode::OK, &resp),
+        Err(e) => e.into_response(),
+    }
+}
+
+async fn handle_list_secrets(storage: &SecretsStorage, body: Bytes) -> Response {
+    let req: ListSecretsRequest = match parse_json(&body) {
+        Ok(r) => r,
+        Err(resp) => return *resp,
+    };
+    match storage.list_secrets(req).await {
+        Ok(resp) => json_response(StatusCode::OK, &resp),
+        Err(e) => e.into_response(),
+    }
+}
+
+async fn handle_update_secret(storage: &SecretsStorage, body: Bytes) -> Response {
+    let req: UpdateSecretRequest = match parse_json(&body) {
+        Ok(r) => r,
+        Err(resp) => return *resp,
+    };
+    match storage.update_secret(req).await {
+        Ok(resp) => json_response(StatusCode::OK, &resp),
+        Err(e) => e.into_response(),
+    }
+}
+
+async fn handle_list_secret_version_ids(storage: &SecretsStorage, body: Bytes) -> Response {
+    let req: ListSecretVersionIdsRequest = match parse_json(&body) {
+        Ok(r) => r,
+        Err(resp) => return *resp,
+    };
+    match storage.list_secret_version_ids(req).await {
         Ok(resp) => json_response(StatusCode::OK, &resp),
         Err(e) => e.into_response(),
     }
