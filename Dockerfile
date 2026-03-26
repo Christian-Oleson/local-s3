@@ -1,4 +1,4 @@
-FROM rust:1.86-slim AS builder
+FROM rust:1.94-slim AS builder
 WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 # Create a dummy main to cache dependency compilation
