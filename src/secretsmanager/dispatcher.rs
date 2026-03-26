@@ -5,11 +5,12 @@ use axum::response::{IntoResponse, Response};
 use super::error::SmError;
 use super::storage::SecretsStorage;
 use super::types::{
-    CancelRotateSecretRequest, CreateSecretRequest, DeleteResourcePolicyRequest,
-    DeleteSecretRequest, DescribeSecretRequest, GetResourcePolicyRequest, GetSecretValueRequest,
-    ListSecretVersionIdsRequest, ListSecretsRequest, PutResourcePolicyRequest,
-    PutSecretValueRequest, RestoreSecretRequest, RotateSecretRequest, TagResourceRequest,
-    UntagResourceRequest, UpdateSecretRequest, UpdateSecretVersionStageRequest,
+    BatchGetSecretValueRequest, CancelRotateSecretRequest, CreateSecretRequest,
+    DeleteResourcePolicyRequest, DeleteSecretRequest, DescribeSecretRequest,
+    GetResourcePolicyRequest, GetSecretValueRequest, ListSecretVersionIdsRequest,
+    ListSecretsRequest, PutResourcePolicyRequest, PutSecretValueRequest, RestoreSecretRequest,
+    RotateSecretRequest, TagResourceRequest, UntagResourceRequest, UpdateSecretRequest,
+    UpdateSecretVersionStageRequest, ValidateResourcePolicyRequest,
 };
 
 /// Dispatch an AWS Secrets Manager operation based on the X-Amz-Target header value.
@@ -32,6 +33,8 @@ pub async fn dispatch(storage: &SecretsStorage, operation: &str, body: Bytes) ->
         "RotateSecret" => handle_rotate_secret(storage, body).await,
         "CancelRotateSecret" => handle_cancel_rotate_secret(storage, body).await,
         "UpdateSecretVersionStage" => handle_update_secret_version_stage(storage, body).await,
+        "BatchGetSecretValue" => handle_batch_get_secret_value(storage, body).await,
+        "ValidateResourcePolicy" => handle_validate_resource_policy(storage, body).await,
         _ => SmError::InvalidParameterException {
             message: format!("Unknown operation: {operation}"),
         }
@@ -221,6 +224,28 @@ async fn handle_update_secret_version_stage(storage: &SecretsStorage, body: Byte
         Err(resp) => return *resp,
     };
     match storage.update_secret_version_stage(req).await {
+        Ok(resp) => json_response(StatusCode::OK, &resp),
+        Err(e) => e.into_response(),
+    }
+}
+
+async fn handle_batch_get_secret_value(storage: &SecretsStorage, body: Bytes) -> Response {
+    let req: BatchGetSecretValueRequest = match parse_json(&body) {
+        Ok(r) => r,
+        Err(resp) => return *resp,
+    };
+    match storage.batch_get_secret_value(req).await {
+        Ok(resp) => json_response(StatusCode::OK, &resp),
+        Err(e) => e.into_response(),
+    }
+}
+
+async fn handle_validate_resource_policy(storage: &SecretsStorage, body: Bytes) -> Response {
+    let req: ValidateResourcePolicyRequest = match parse_json(&body) {
+        Ok(r) => r,
+        Err(resp) => return *resp,
+    };
+    match storage.validate_resource_policy(req).await {
         Ok(resp) => json_response(StatusCode::OK, &resp),
         Err(e) => e.into_response(),
     }

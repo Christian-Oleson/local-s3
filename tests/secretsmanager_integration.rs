@@ -1062,3 +1062,135 @@ async fn test_update_version_stage() {
         "v2 should still have AWSCURRENT"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Phase 5 tests: BatchGetSecretValue + ValidateResourcePolicy
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_batch_get_secret_value() {
+    let s = TestServer::start().await;
+
+    // Create 3 secrets
+    for name in &["batch-one", "batch-two", "batch-three"] {
+        s.sm_client
+            .create_secret()
+            .name(*name)
+            .secret_string(format!("value-{name}"))
+            .send()
+            .await
+            .unwrap();
+    }
+
+    let result = s
+        .sm_client
+        .batch_get_secret_value()
+        .secret_id_list("batch-one")
+        .secret_id_list("batch-two")
+        .secret_id_list("batch-three")
+        .send()
+        .await
+        .unwrap();
+
+    let values = result.secret_values();
+    assert_eq!(values.len(), 3, "Should return all 3 secret values");
+
+    let names: Vec<&str> = values.iter().filter_map(|v| v.name()).collect();
+    assert!(names.contains(&"batch-one"));
+    assert!(names.contains(&"batch-two"));
+    assert!(names.contains(&"batch-three"));
+
+    // Verify the errors list is empty
+    let errors = result.errors();
+    assert!(errors.is_empty(), "Should have no errors");
+}
+
+#[tokio::test]
+async fn test_batch_get_partial_failure() {
+    let s = TestServer::start().await;
+
+    // Create only 1 secret
+    s.sm_client
+        .create_secret()
+        .name("batch-real")
+        .secret_string("real-value")
+        .send()
+        .await
+        .unwrap();
+
+    let result = s
+        .sm_client
+        .batch_get_secret_value()
+        .secret_id_list("batch-real")
+        .secret_id_list("batch-nonexistent")
+        .send()
+        .await
+        .unwrap();
+
+    let values = result.secret_values();
+    assert_eq!(values.len(), 1, "Should have 1 successful value");
+    assert_eq!(values[0].name(), Some("batch-real"));
+    assert_eq!(values[0].secret_string(), Some("real-value"));
+
+    let errors = result.errors();
+    assert_eq!(errors.len(), 1, "Should have 1 error");
+    assert_eq!(
+        errors[0].secret_id(),
+        Some("batch-nonexistent"),
+        "Error should be for the missing secret"
+    );
+    assert_eq!(
+        errors[0].error_code(),
+        Some("ResourceNotFoundException"),
+        "Error code should be ResourceNotFoundException"
+    );
+}
+
+#[tokio::test]
+async fn test_validate_policy_valid() {
+    let s = TestServer::start().await;
+
+    let valid_policy = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"secretsmanager:GetSecretValue","Resource":"*"}]}"#;
+
+    let result = s
+        .sm_client
+        .validate_resource_policy()
+        .resource_policy(valid_policy)
+        .send()
+        .await
+        .unwrap();
+
+    assert!(
+        result.policy_validation_passed(),
+        "Valid JSON policy should pass validation"
+    );
+    assert!(
+        result.validation_errors().is_empty(),
+        "Valid policy should have no validation errors"
+    );
+}
+
+#[tokio::test]
+async fn test_validate_policy_invalid() {
+    let s = TestServer::start().await;
+
+    let result = s
+        .sm_client
+        .validate_resource_policy()
+        .resource_policy("not json at all")
+        .send()
+        .await
+        .unwrap();
+
+    assert!(
+        !result.policy_validation_passed(),
+        "Invalid JSON should fail validation"
+    );
+    let errors = result.validation_errors();
+    assert_eq!(errors.len(), 1, "Should have 1 validation error");
+    assert_eq!(
+        errors[0].check_name(),
+        Some("JsonSyntax"),
+        "Error check name should be JsonSyntax"
+    );
+}

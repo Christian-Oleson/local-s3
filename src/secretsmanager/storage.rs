@@ -7,6 +7,7 @@ use uuid::Uuid;
 
 use super::error::SmError;
 use super::types::{
+    BatchGetSecretValueRequest, BatchGetSecretValueResponse, BatchSecretError, BatchSecretValue,
     CancelRotateSecretRequest, CancelRotateSecretResponse, CreateSecretRequest,
     CreateSecretResponse, DeleteResourcePolicyRequest, DeleteResourcePolicyResponse,
     DeleteSecretRequest, DeleteSecretResponse, DescribeSecretRequest, DescribeSecretResponse,
@@ -17,7 +18,8 @@ use super::types::{
     RotateSecretRequest, RotateSecretResponse, SecretFilter, SecretListEntry, SecretMetadata,
     SecretVersion, SecretVersionEntry, TagResourceRequest, UntagResourceRequest,
     UpdateSecretRequest, UpdateSecretResponse, UpdateSecretVersionStageRequest,
-    UpdateSecretVersionStageResponse,
+    UpdateSecretVersionStageResponse, ValidateResourcePolicyRequest,
+    ValidateResourcePolicyResponse, ValidationError,
 };
 
 pub struct SecretsStorage {
@@ -791,6 +793,113 @@ impl SecretsStorage {
             arn: metadata.arn,
             name: metadata.name,
         })
+    }
+
+    // -----------------------------------------------------------------------
+    // BatchGetSecretValue
+    // -----------------------------------------------------------------------
+
+    pub async fn batch_get_secret_value(
+        &self,
+        req: BatchGetSecretValueRequest,
+    ) -> Result<BatchGetSecretValueResponse, SmError> {
+        let max_results = req.max_results.unwrap_or(20).min(20) as usize;
+
+        // Decode pagination token (base64-encoded index into the id list)
+        let start_index: usize = req
+            .next_token
+            .as_deref()
+            .and_then(super::types::decode_next_token)
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(0);
+
+        let ids = &req.secret_id_list;
+        let end_index = (start_index + max_results).min(ids.len());
+        let page_ids = &ids[start_index..end_index];
+
+        let mut secret_values = Vec::new();
+        let mut errors = Vec::new();
+
+        for secret_id in page_ids {
+            let get_req = GetSecretValueRequest {
+                secret_id: secret_id.clone(),
+                version_id: None,
+                version_stage: None,
+            };
+            match self.get_secret_value(get_req).await {
+                Ok(resp) => {
+                    secret_values.push(BatchSecretValue {
+                        arn: resp.arn,
+                        name: resp.name,
+                        version_id: resp.version_id,
+                        secret_string: resp.secret_string,
+                        secret_binary: resp.secret_binary,
+                        version_stages: resp.version_stages,
+                        created_date: resp.created_date,
+                    });
+                }
+                Err(e) => {
+                    let error_code = match &e {
+                        SmError::ResourceNotFoundException { .. } => {
+                            "ResourceNotFoundException".to_string()
+                        }
+                        SmError::InvalidRequestException { .. } => {
+                            "InvalidRequestException".to_string()
+                        }
+                        other => format!("{other:?}")
+                            .split_whitespace()
+                            .next()
+                            .unwrap_or("InternalServiceError")
+                            .to_string(),
+                    };
+                    errors.push(BatchSecretError {
+                        secret_id: secret_id.clone(),
+                        error_code,
+                        message: e.to_string(),
+                    });
+                }
+            }
+        }
+
+        let next_token = if end_index < ids.len() {
+            Some(super::types::encode_next_token(&end_index.to_string()))
+        } else {
+            None
+        };
+
+        Ok(BatchGetSecretValueResponse {
+            secret_values,
+            errors,
+            next_token,
+        })
+    }
+
+    // -----------------------------------------------------------------------
+    // ValidateResourcePolicy
+    // -----------------------------------------------------------------------
+
+    pub async fn validate_resource_policy(
+        &self,
+        req: ValidateResourcePolicyRequest,
+    ) -> Result<ValidateResourcePolicyResponse, SmError> {
+        // If a SecretId is provided, verify it exists
+        if let Some(ref secret_id) = req.secret_id {
+            let _ = self.resolve_secret(secret_id).await?;
+        }
+
+        match serde_json::from_str::<serde_json::Value>(&req.resource_policy) {
+            Ok(_) => Ok(ValidateResourcePolicyResponse {
+                policy_validation_passed: true,
+                validation_errors: vec![],
+            }),
+            Err(e) => Ok(ValidateResourcePolicyResponse {
+                policy_validation_passed: false,
+                validation_errors: vec![ValidationError {
+                    check_name: "JsonSyntax".to_string(),
+                    error_message: format!("Invalid JSON in resource policy: {e}"),
+                }],
+            }),
+        }
     }
 
     // -----------------------------------------------------------------------

@@ -130,6 +130,46 @@ All responses use S3's XML format. Error responses follow S3's `<Error><Code>...
 - **Lifecycle rules**: stored but not executed
 - Any credential values are accepted (use `"test"` / `"test"` for simplicity)
 
+## Secrets Manager
+
+Both S3 and Secrets Manager run on the same port (4566). Set `AWS_ENDPOINT_URL=http://localhost:4566` once and both services work without any other configuration change.
+
+### Secrets Manager SDK Configuration
+
+#### AWS CLI
+
+```bash
+aws --endpoint-url http://localhost:4566 secretsmanager create-secret --name my-secret --secret-string '{"password":"abc123"}'
+aws --endpoint-url http://localhost:4566 secretsmanager get-secret-value --secret-id my-secret
+```
+
+#### Python (boto3)
+
+```python
+client = boto3.client('secretsmanager', endpoint_url='http://localhost:4566')
+```
+
+#### Node.js (aws-sdk v3)
+
+```javascript
+import { SecretsManagerClient } from "@aws-sdk/client-secrets-manager";
+const client = new SecretsManagerClient({ endpoint: "http://localhost:4566" });
+```
+
+### Supported Secrets Manager Operations
+
+| Category | Operations |
+|----------|-----------|
+| Core CRUD | CreateSecret, GetSecretValue, PutSecretValue, UpdateSecret, DeleteSecret, RestoreSecret |
+| Discovery | DescribeSecret, ListSecrets, ListSecretVersionIds |
+| Versioning | UpdateSecretVersionStage (AWSCURRENT/AWSPREVIOUS/custom labels) |
+| Tags | TagResource, UntagResource |
+| Policies | PutResourcePolicy, GetResourcePolicy, DeleteResourcePolicy, ValidateResourcePolicy |
+| Rotation | RotateSecret, CancelRotateSecret (config storage, no Lambda) |
+| Batch | BatchGetSecretValue |
+
+**Protocol note:** Secrets Manager uses AWS JSON 1.1 protocol (POST / with X-Amz-Target header, JSON bodies) — different from S3's REST+XML. The server routes requests automatically: any request with an `X-Amz-Target` header beginning with `secretsmanager.` is dispatched to the Secrets Manager handler; all other requests go to S3.
+
 ## Configuration
 
 | Option | Env Var | CLI Flag | Default |
@@ -171,6 +211,13 @@ data/
     photo.jpg.meta.json       # content-type, custom headers, etag
     documents/report.pdf
     documents/report.pdf.meta.json
+  .secrets-manager/
+    secrets/
+      my-secret/
+        metadata.json         # name, ARN, description, tags, rotation config
+        policy.json           # resource policy
+        versions/
+          {version-id}.json   # secret value + staging labels
 ```
 
 Each bucket is a directory. Object data is stored as a plain file at the key path. Metadata (Content-Type, ETag, `x-amz-meta-*` headers, etc.) is stored in a sidecar `.meta.json` file alongside each object.
@@ -178,6 +225,8 @@ Each bucket is a directory. Object data is stored as a plain file at the key pat
 Multipart upload state is kept under a `.uploads/` directory inside each bucket and cleaned up automatically on complete or abort.
 
 Versioned objects maintain a version chain directory per key. Delete markers are stored as zero-byte version entries.
+
+Secrets are stored under `.secrets-manager/secrets/` with one subdirectory per secret name. Each version is a separate JSON file under `versions/`.
 
 Use a Docker volume to persist data across restarts:
 
@@ -217,12 +266,16 @@ docker run -p 4566:4566 -v ./data:/data local-s3
 ```
 src/
   main.rs          # Entry point: arg/env parsing, logging setup
-  server.rs        # axum router, AppState, CORS preflight handler
-  routes/
-    bucket.rs      # Bucket operation handlers
-    object.rs      # Object operation handlers
-  storage/         # Filesystem storage engine
-  middleware.rs    # S3 response header injection (x-amz-request-id, etc.)
+  server.rs        # axum router, AppState, service multiplexer, CORS preflight handler
+  services/
+    s3/            # S3 request handlers and storage engine
+    secretsmanager/
+      dispatcher.rs  # X-Amz-Target routing
+      handlers.rs    # Operation handlers
+      storage.rs     # Filesystem-backed secret storage
+      types.rs       # Request/response JSON types
+      error.rs       # Secrets Manager error types
+  middleware.rs    # Response header injection (x-amz-request-id, etc.)
 tests/
   integration/     # AWS SDK integration tests (aws-sdk-rust)
 ```
@@ -234,6 +287,7 @@ tests/
 - **ETags** are quoted MD5 hex for single-part uploads (`"abc123"`) and quoted `MD5-partcount` for multipart (`"abc123-3"`)
 - `DeleteObject` returns 204 even for non-existent keys (S3 behavior)
 - `ListObjectsV2` with a delimiter returns `CommonPrefixes` entries for simulated folder navigation
+- **Service multiplexing**: the `X-Amz-Target` header determines whether a request goes to S3 or Secrets Manager — no port split required
 
 ## License
 

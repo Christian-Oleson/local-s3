@@ -476,6 +476,86 @@ pub struct UpdateSecretVersionStageResponse {
 }
 
 // ---------------------------------------------------------------------------
+// BatchGetSecretValue
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+pub struct BatchGetSecretValueRequest {
+    #[serde(rename = "SecretIdList")]
+    pub secret_id_list: Vec<String>,
+    #[serde(rename = "MaxResults")]
+    pub max_results: Option<i32>,
+    #[serde(rename = "NextToken")]
+    pub next_token: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct BatchGetSecretValueResponse {
+    #[serde(rename = "SecretValues")]
+    pub secret_values: Vec<BatchSecretValue>,
+    #[serde(rename = "Errors")]
+    pub errors: Vec<BatchSecretError>,
+    #[serde(rename = "NextToken", skip_serializing_if = "Option::is_none")]
+    pub next_token: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct BatchSecretValue {
+    #[serde(rename = "ARN")]
+    pub arn: String,
+    #[serde(rename = "Name")]
+    pub name: String,
+    #[serde(rename = "VersionId")]
+    pub version_id: String,
+    #[serde(rename = "SecretString", skip_serializing_if = "Option::is_none")]
+    pub secret_string: Option<String>,
+    #[serde(rename = "SecretBinary", skip_serializing_if = "Option::is_none")]
+    pub secret_binary: Option<String>,
+    #[serde(rename = "VersionStages")]
+    pub version_stages: Vec<String>,
+    #[serde(rename = "CreatedDate")]
+    pub created_date: f64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct BatchSecretError {
+    #[serde(rename = "SecretId")]
+    pub secret_id: String,
+    #[serde(rename = "ErrorCode")]
+    pub error_code: String,
+    #[serde(rename = "Message")]
+    pub message: String,
+}
+
+// ---------------------------------------------------------------------------
+// ValidateResourcePolicy
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+pub struct ValidateResourcePolicyRequest {
+    #[serde(rename = "SecretId")]
+    pub secret_id: Option<String>,
+    #[serde(rename = "ResourcePolicy")]
+    pub resource_policy: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ValidateResourcePolicyResponse {
+    #[serde(rename = "PolicyValidationPassed")]
+    pub policy_validation_passed: bool,
+    #[serde(rename = "ValidationErrors")]
+    pub validation_errors: Vec<ValidationError>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ValidationError {
+    #[serde(rename = "CheckName")]
+    pub check_name: String,
+    #[serde(rename = "ErrorMessage")]
+    pub error_message: String,
+}
+
+// ---------------------------------------------------------------------------
 // Pagination helpers
 // ---------------------------------------------------------------------------
 

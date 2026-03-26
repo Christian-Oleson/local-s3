@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Repository Overview
 
-`local-s3` is a fast, lightweight S3-compatible server written in Rust. It replaces LocalStack's S3 for local development — no account signup required. Filesystem-backed with Docker volume persistence.
+`local-s3` is a fast, lightweight S3-compatible server written in Rust. It replaces LocalStack's S3 and Secrets Manager for local development — no account signup required. Filesystem-backed with Docker volume persistence. Both services run on port 4566.
 
 ## Commands
 
@@ -48,11 +48,13 @@ services:
 
 - **axum** for HTTP (tokio-based, zero-cost routing)
 - **quick-xml** for S3 XML serialization/deserialization (S3 uses XML, not JSON)
-- **Filesystem storage**: buckets are directories, objects are files, metadata in sidecar `.meta.json` files
+- **serde_json** for Secrets Manager JSON protocol (no new crates needed)
+- **Filesystem storage**: buckets are directories, objects are files, metadata in sidecar `.meta.json` files; secrets in `.secrets-manager/`
 - **Path-style URLs** as primary routing: `http://localhost:4566/bucket/key`
 - **Virtual-hosted-style** as secondary: `http://bucket.s3.localhost:4566/key`
 - **SigV4 passthrough**: accept any AWS signature without validation (local dev only)
 - **Port 4566**: same as LocalStack default for drop-in replacement
+- **Service multiplexing**: `X-Amz-Target` header starting with `secretsmanager.` routes to Secrets Manager; everything else routes to S3
 
 ### S3 Behavioral Requirements
 
@@ -80,6 +82,61 @@ services:
 | Config | PutBucketPolicy, GetBucketPolicy, DeleteBucketPolicy, Put/GetBucketAcl, Put/GetObjectAcl, Lifecycle configuration |
 | Advanced | Range requests (206), Conditional requests (304), Presigned URL acceptance |
 
+## Secrets Manager
+
+19 operations implemented across 4 phases. Achieves full LocalStack Community parity for Secrets Manager.
+
+### Protocol: AWS JSON 1.1
+
+Secrets Manager uses a fundamentally different protocol from S3:
+
+- **All requests**: `POST /` with `Content-Type: application/x-amz-json-1.1`
+- **Action dispatch**: `X-Amz-Target: secretsmanager.<OperationName>` header
+- **Request/response bodies**: JSON (not XML)
+- **Errors**: JSON with `__type` and `Message` fields, HTTP 400 for client errors (including not-found)
+
+### Secrets Manager Behavioral Requirements
+
+- `ResourceNotFoundException` returns HTTP 400, not 404 — SDK compatibility requires this
+- ARN format: `arn:aws:secretsmanager:{region}:{account}:secret:{name}-{6-random-chars}`
+- Account ID: `000000000000` (matching LocalStack convention)
+- `AWSCURRENT` label: exactly one version per secret holds this at all times
+- `AWSPREVIOUS` label: at most one version (the previous AWSCURRENT)
+- `PutSecretValue` promotes new version to AWSCURRENT, demotes old AWSCURRENT to AWSPREVIOUS, strips AWSPREVIOUS from the version before that
+
+### Supported Secrets Manager Operations
+
+| Category | Operations |
+|----------|-----------|
+| Core CRUD | CreateSecret, GetSecretValue, PutSecretValue, UpdateSecret, DeleteSecret, RestoreSecret |
+| Discovery | DescribeSecret, ListSecrets, ListSecretVersionIds |
+| Versioning | UpdateSecretVersionStage (AWSCURRENT/AWSPREVIOUS/custom labels) |
+| Tags | TagResource, UntagResource |
+| Policies | PutResourcePolicy, GetResourcePolicy, DeleteResourcePolicy, ValidateResourcePolicy |
+| Rotation | RotateSecret, CancelRotateSecret (config storage, no Lambda) |
+| Batch | BatchGetSecretValue |
+
+### Storage Layout
+
+```
+{data-dir}/
+  .secrets-manager/
+    secrets/
+      {secret-name}/
+        metadata.json       # name, ARN, description, tags, rotation config
+        policy.json         # resource policy (raw JSON string)
+        versions/
+          {version-id}.json # { SecretString/SecretBinary, VersionStages, CreatedDate }
+```
+
+### Out of Scope (by design)
+
+- KMS encryption: KmsKeyId is accepted and stored, not used for actual encryption
+- Lambda rotation execution: rotation config is stored, no Lambda is invoked
+- IAM policy enforcement: resource policies are stored only
+- Cross-region replication
+- Service quota enforcement
+
 ## Configuration
 
 | Option | Env Var | CLI Flag | Default |
@@ -95,26 +152,12 @@ CLI flags take precedence over environment variables.
 - Rust 2024 edition, latest stable toolchain
 - `cargo fmt` + `cargo clippy -- -D warnings` must pass before commit
 - All public APIs have integration tests using AWS SDK clients
-- Error types use thiserror, map to proper S3 error codes and HTTP status
+- Error types use thiserror, map to proper error codes and HTTP status
 - Async everywhere — no blocking I/O on the tokio runtime
-
-## Secrets Manager (In Progress)
-
-The project is expanding to include an AWS Secrets Manager emulator on the same port (4566). Key differences from S3:
-
-- **Protocol:** AWS JSON 1.1 (`POST /`, `X-Amz-Target: secretsmanager.<Op>`, JSON bodies) — not REST+XML
-- **Routing:** `X-Amz-Target` header starting with `secretsmanager.` routes to Secrets Manager; all else routes to S3
-- **Errors:** JSON format `{"__type": "ErrorCode", "Message": "..."}`, HTTP 400 for most client errors (including not-found)
-- **Storage:** `{data-dir}/.secrets-manager/secrets/{name}/` with `metadata.json` + `versions/{id}.json`
-
-Planning docs:
-- `PRD-secrets-manager.md` — full product requirements
-- `PROJECT-secrets-manager.md` — requirements summary
-- `ROADMAP-secrets-manager.md` — 4-phase delivery plan
-- `STATE-secrets-manager.md` — progress tracking
 
 ## Project Planning
 
 Planning documents live in `.planning/`:
 - `PROJECT.md` / `ROADMAP.md` / `STATE.md` — S3 service (complete)
-- `PROJECT-secrets-manager.md` / `ROADMAP-secrets-manager.md` / `STATE-secrets-manager.md` — Secrets Manager
+- `PRD-secrets-manager.md` — full product requirements for Secrets Manager
+- `PROJECT-secrets-manager.md` / `ROADMAP-secrets-manager.md` / `STATE-secrets-manager.md` — Secrets Manager planning and progress
