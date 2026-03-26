@@ -1,104 +1,97 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!-- Dos Apes Super Agent Framework - Phase Plan -->
-<!-- Generated: 2026-03-25 -->
-<!-- Phase: SM-2 (Secrets Manager Phase 2) -->
+<!-- Generated: 2026-03-26 -->
+<!-- Phase: SM-3 -->
 
 <plan>
   <metadata>
-    <phase>SM-2</phase>
-    <name>Metadata + Discovery</name>
-    <goal>Full secret metadata, listing with filtering/pagination, version enumeration</goal>
-    <deliverable>Full secret lifecycle management and discovery via any AWS SDK</deliverable>
-    <created>2026-03-25</created>
+    <phase>SM-3</phase>
+    <name>Version Management, Tags, Policies, Rotation</name>
+    <goal>Advanced version stage management, tagging, resource policies, rotation config storage</goal>
+    <deliverable>Full LocalStack Community parity for Secrets Manager</deliverable>
+    <created>2026-03-26</created>
   </metadata>
 
   <context>
-    <dependencies>SM Phase 1 complete — CreateSecret, GetSecretValue, PutSecretValue, DeleteSecret, RestoreSecret, 208 tests</dependencies>
+    <dependencies>SM Phase 2 complete — 9 SM operations implemented, 216 tests</dependencies>
     <affected_areas>
-      - src/secretsmanager/storage.rs — add describe, list, update, list_versions methods
-      - src/secretsmanager/dispatcher.rs — add 4 new operation handlers
-      - src/secretsmanager/types.rs — add request/response types for 4 new operations
-      - tests/secretsmanager_integration.rs — new integration tests
+      - src/secretsmanager/storage.rs — 8 new methods (all simple CRUD)
+      - src/secretsmanager/dispatcher.rs — 8 new dispatch entries
+      - src/secretsmanager/types.rs — request/response types for 8 operations
+      - tests/secretsmanager_integration.rs — integration tests
     </affected_areas>
     <patterns_to_follow>
-      - Follow existing dispatcher pattern: deserialize JSON → call storage → serialize JSON
-      - PascalCase JSON field names with serde rename
-      - Content-Type: application/x-amz-json-1.1
-      - Timestamps as f64 epoch seconds
-      - Pagination: MaxResults + NextToken pattern (opaque token)
-      - VersionIdsToStages: HashMap of version_id → Vec of staging labels
+      - All operations: POST / with X-Amz-Target, JSON request/response
+      - Tags stored in metadata.json tags array
+      - Resource policy stored in policy.json (raw JSON string)
+      - Rotation config stored in metadata.json (rotation_enabled, rotation_lambda_arn, rotation_rules)
+      - UpdateSecretVersionStage: move/remove labels, update version files + metadata
+      - All store-only (no enforcement, no Lambda invocation)
     </patterns_to_follow>
   </context>
 
   <tasks>
     <task id="1" type="backend" complete="false">
-      <name>DescribeSecret, ListSecrets, UpdateSecret, ListSecretVersionIds</name>
+      <name>All 8 operations: version stages, tags, policies, rotation</name>
       <description>
-        Implement all 4 metadata/discovery operations in storage + dispatcher + types.
-        These are medium-complexity: DescribeSecret is a metadata read, ListSecrets needs
-        filtering and pagination, UpdateSecret combines metadata + optional value update,
-        ListSecretVersionIds enumerates versions.
+        Implement UpdateSecretVersionStage, TagResource, UntagResource,
+        PutResourcePolicy, GetResourcePolicy, DeleteResourcePolicy,
+        RotateSecret, CancelRotateSecret. All are simple storage operations.
+        Include unit tests.
       </description>
 
       <files>
-        <modify>src/secretsmanager/storage.rs    — add 4 storage methods</modify>
-        <modify>src/secretsmanager/dispatcher.rs — add 4 dispatch handlers</modify>
-        <modify>src/secretsmanager/types.rs      — add request/response types</modify>
+        <modify>src/secretsmanager/storage.rs    — 8 new methods</modify>
+        <modify>src/secretsmanager/dispatcher.rs — 8 new dispatch entries</modify>
+        <modify>src/secretsmanager/types.rs      — request/response types</modify>
       </files>
 
       <action>
-        1. Add types to types.rs:
+        1. UpdateSecretVersionStage:
+           Request: { SecretId, VersionStage, MoveToVersionId, RemoveFromVersionId }
+           Response: { ARN, Name }
+           - Move a staging label from one version to another
+           - Update version files on disk + metadata.version_ids_to_stages
 
-           DescribeSecretRequest: { SecretId }
-           DescribeSecretResponse: { ARN, Name, Description, KmsKeyId, RotationEnabled,
-             RotationLambdaARN, RotationRules, LastRotatedDate, LastChangedDate,
-             LastAccessedDate, DeletedDate, Tags, VersionIdsToStages, CreatedDate }
-           Note: VersionIdsToStages is a HashMap&lt;String, Vec&lt;String&gt;&gt;
+        2. TagResource:
+           Request: { SecretId, Tags: [{Key,Value}] }
+           Response: {} (empty)
+           - Additive: merge new tags into existing, overwrite on key match
+           - Update metadata.json
 
-           ListSecretsRequest: { MaxResults, NextToken, Filters, SortOrder, IncludePlannedDeletion }
-           Filter: { Key, Values: Vec&lt;String&gt; }
-           ListSecretsResponse: { SecretList: Vec&lt;SecretListEntry&gt;, NextToken }
-           SecretListEntry: same fields as DescribeSecretResponse but named SecretVersionsToStages
+        3. UntagResource:
+           Request: { SecretId, TagKeys: [String] }
+           Response: {} (empty)
+           - Remove matching tag keys from metadata
 
-           UpdateSecretRequest: { SecretId, SecretString, SecretBinary, Description, KmsKeyId, ClientRequestToken }
-           UpdateSecretResponse: { ARN, Name, VersionId (optional — only if value changed) }
+        4. PutResourcePolicy:
+           Request: { SecretId, ResourcePolicy: String, BlockPublicPolicy: bool }
+           Response: { ARN, Name }
+           - Store raw JSON policy string in policy.json file
 
-           ListSecretVersionIdsRequest: { SecretId, MaxResults, NextToken, IncludeDeprecated }
-           ListSecretVersionIdsResponse: { ARN, Name, Versions: Vec&lt;SecretVersionInfo&gt;, NextToken }
-           SecretVersionInfo: { VersionId, VersionStages, CreatedDate, LastAccessedDate }
+        5. GetResourcePolicy:
+           Request: { SecretId }
+           Response: { ARN, Name, ResourcePolicy: String }
+           - Return stored policy or null if none
 
-        2. Add storage methods:
+        6. DeleteResourcePolicy:
+           Request: { SecretId }
+           Response: { ARN, Name }
+           - Delete policy.json file
 
-           a) describe_secret(secret_id) → metadata + version_ids_to_stages
-              - Resolve secret_id, return full metadata
-              - Build VersionIdsToStages from scanning version files
+        7. RotateSecret:
+           Request: { SecretId, ClientRequestToken, RotationLambdaARN, RotationRules: { AutomaticallyAfterDays, Duration, ScheduleExpression }, RotateImmediately }
+           Response: { ARN, Name, VersionId }
+           - Store rotation config in metadata (rotation_enabled=true, rotation_lambda_arn, rotation_rules)
+           - Don't actually invoke Lambda — just store the config
+           - Create a new version with AWSPENDING label if RotateImmediately (default true)
 
-           b) list_secrets(max_results, next_token, filters, include_planned_deletion) → (Vec&lt;metadata&gt;, next_token)
-              - Scan all secret directories
-              - Apply filters: "name" (contains), "description" (contains),
-                "tag-key" (tag key matches), "tag-value" (tag value matches), "all" (any field)
-              - Exclude deleted secrets unless include_planned_deletion
-              - Sort by name (default)
-              - Paginate with max_results (default 100) + next_token (base64-encoded last name)
+        8. CancelRotateSecret:
+           Request: { SecretId }
+           Response: { ARN, Name }
+           - Set rotation_enabled=false, clear AWSPENDING label
 
-           c) update_secret(secret_id, description, kms_key_id, secret_string, secret_binary, client_token)
-              - Resolve and check not deleted
-              - Update metadata fields (description, kms_key_id) if provided
-              - If secret_string or secret_binary provided: create new version (same as put_secret_value)
-              - Return version_id only if value was updated
-
-           d) list_secret_version_ids(secret_id, max_results, next_token, include_deprecated) → versions
-              - Read all version files for the secret
-              - If !include_deprecated: only versions with staging labels
-              - Paginate
-
-        3. Add dispatcher entries:
-           - "DescribeSecret" → handle_describe_secret
-           - "ListSecrets" → handle_list_secrets
-           - "UpdateSecret" → handle_update_secret
-           - "ListSecretVersionIds" → handle_list_secret_version_ids
-
-        4. Add unit tests for each storage method.
+        Add unit tests for each operation.
       </action>
 
       <verification>
@@ -109,38 +102,31 @@
       </verification>
 
       <done>
-        - All 4 operations work through dispatcher
-        - DescribeSecret returns full metadata with VersionIdsToStages
-        - ListSecrets supports filtering by name, tag, description
-        - ListSecrets pagination works with MaxResults + NextToken
-        - UpdateSecret updates metadata and optionally creates new version
-        - ListSecretVersionIds enumerates versions with IncludeDeprecated
-        - All 208 existing tests pass
+        - All 8 operations work through dispatcher
+        - Tags are additive/removable
+        - Policy stored/returned as raw JSON string
+        - Rotation config stored in metadata
+        - All 216 existing tests pass
       </done>
     </task>
 
     <task id="2" type="test" complete="false">
-      <name>Integration tests for metadata and discovery operations</name>
+      <name>Integration tests for all Phase 3 operations</name>
       <description>
-        AWS SDK integration tests for DescribeSecret, ListSecrets, UpdateSecret,
-        and ListSecretVersionIds.
+        AWS SDK integration tests for version stages, tags, policies, rotation.
       </description>
 
       <files>
-        <modify>tests/secretsmanager_integration.rs — add integration tests</modify>
+        <modify>tests/secretsmanager_integration.rs</modify>
       </files>
 
       <action>
-        Add to existing secretsmanager_integration.rs:
-
-        - test_describe_secret: create secret with tags+description, describe → verify all fields
-        - test_describe_secret_version_stages: create, put new value, describe → verify VersionIdsToStages has AWSCURRENT + AWSPREVIOUS
-        - test_list_secrets: create 3 secrets, list → all 3 returned
-        - test_list_secrets_pagination: create 5 secrets, list with max_results=2, paginate through all
-        - test_list_secrets_filter_by_name: create 3, filter by name substring → correct subset
-        - test_update_secret_metadata: create, update description, describe → new description
-        - test_update_secret_value: create, update with new value, get → new value
-        - test_list_secret_version_ids: create, put 2 more values, list versions → 3 versions
+        Add integration tests:
+        - test_tag_and_untag_resource: add tags, describe → verify, remove tag, describe → verify
+        - test_put_and_get_resource_policy: put JSON policy, get → verify round-trip
+        - test_delete_resource_policy: put, delete, get → null/error
+        - test_rotate_secret: configure rotation, describe → rotation_enabled=true
+        - test_update_version_stage: create, put new value, move custom label, verify
       </action>
 
       <verification>
@@ -149,8 +135,9 @@
       </verification>
 
       <done>
-        - All new integration tests pass with real aws-sdk-secretsmanager
-        - All 208 existing tests still pass
+        - All integration tests pass with real AWS SDK
+        - All existing tests still pass
+        - Full LocalStack Community parity for SM
       </done>
     </task>
   </tasks>
@@ -166,8 +153,8 @@
 
   <completion_criteria>
     <criterion>Both tasks complete</criterion>
-    <criterion>All 4 operations work via AWS SDK</criterion>
-    <criterion>ListSecrets filtering and pagination work</criterion>
-    <criterion>All 208+ tests pass</criterion>
+    <criterion>All 8 new operations work via AWS SDK</criterion>
+    <criterion>17 total SM operations implemented</criterion>
+    <criterion>All 216+ tests pass</criterion>
   </completion_criteria>
 </plan>

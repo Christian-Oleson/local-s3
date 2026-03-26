@@ -3,8 +3,8 @@
 ## Current Position
 
 - **Phase:** 3 - Version Management, Tags, Policies
-- **Task:** Not started
-- **Status:** planning
+- **Task:** 1 (pending)
+- **Status:** planned
 
 ## Progress
 
